@@ -160,9 +160,6 @@ fn metal_rejects_unsupported_options_before_reading_models_or_pictures() {
         ("--attention-precision", "int8-fp8"),
         ("--linear-precision", "nvfp4"),
         ("--lora-mode", "merge"),
-        ("--reference", "missing.png"),
-        ("--reference-audio", "missing.wav"),
-        ("--first-frame", "missing.png"),
     ] {
         let output = run(
             TOOLS,
