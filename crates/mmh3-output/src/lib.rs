@@ -97,13 +97,15 @@ pub trait OutputBackend {
     fn write(&self, media: &DecodedMedia<'_>, destination: &Path) -> Result<()>;
 }
 
-pub(crate) fn output_parent(path: &Path) -> &Path {
+/// The directory a file at `path` is written in.
+pub fn output_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
 }
 
-pub(crate) fn validate_destination(path: &Path) -> Result<()> {
+/// Checks that `path` names a file this process can write beside, before anything is generated.
+pub fn validate_destination(path: &Path) -> Result<()> {
     if path.file_name().is_none() || path.is_dir() {
         return Err("--out must name an output file".into());
     }

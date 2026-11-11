@@ -38,6 +38,7 @@ mmh3-output-videotoolbox = { path = "crates/mmh3-output-videotoolbox", optional 
 mmh3-output-nvenc = { path = "crates/mmh3-output-nvenc", optional = true }
 symphonia = { version = "0.6", features = ["all"] }
 rubato = "0.16"
+tempfile = "3"
 
 [workspace]
 members = ["crates/mmh3-core", "crates/mmh3-cpu", "crates/mmh3-cuda", "crates/mmh3-input", "crates/mmh3-input-nvdec", "crates/mmh3-input-videotoolbox", "crates/mmh3-metal", "crates/mmh3-output", "crates/mmh3-output-nvenc", "crates/mmh3-output-videotoolbox", "crates/mmh3-rdma", "crates/mmh3-swift-build"]
