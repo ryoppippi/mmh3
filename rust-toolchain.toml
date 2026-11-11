@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.97.1"
+# rustup's default profile adds rust-docs, which every Nix store would download
+# and unpack for nothing.
+profile = "minimal"
+components = ["clippy", "rustfmt"]
