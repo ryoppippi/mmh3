@@ -151,6 +151,7 @@ enum Stage {
     Running,
     Done,
     Failed,
+    Cancelled,
 }
 
 impl Stage {
@@ -160,7 +161,12 @@ impl Stage {
             Stage::Running => "running",
             Stage::Done => "done",
             Stage::Failed => "failed",
+            Stage::Cancelled => "cancelled",
         }
+    }
+
+    fn ended(self) -> bool {
+        matches!(self, Stage::Done | Stage::Failed | Stage::Cancelled)
     }
 }
 
@@ -343,7 +349,10 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .name("generate".to_owned())
         .spawn(move || {
             for id in waiting {
-                generate(&generating, &id);
+                generate(&generating, &id, |arguments, output| match output {
+                    Output::Video => crate::generate::run(arguments, USAGE),
+                    Output::Picture => crate::image::run(arguments),
+                });
             }
         })?;
 
@@ -352,6 +361,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .route("/v1/images", post(create_image))
         .route("/v1/status", get(status))
         .route("/v1/generations/{id}", get(describe).delete(forget))
+        .route("/v1/generations/{id}/cancel", post(cancel))
         .route("/v1/generations/{id}/events", get(events))
         .route("/v1/generations/{id}/video", get(video))
         .route("/v1/generations/{id}/image", get(image))
@@ -371,23 +381,28 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Runs one job to its end, whichever end that is.
-fn generate(server: &Server, id: &str) {
+/// Runs one job to its end, whichever end that is, with `run`, which is handed what the generation
+/// was told and what it writes.
+fn generate(
+    server: &Server,
+    id: &str,
+    run: impl FnOnce(&[String], Output) -> Result<(), Box<dyn Error>>,
+) {
     let (arguments, output) = {
         let mut jobs = server.jobs.lock().expect("the jobs");
-        let Some(job) = jobs.get_mut(id) else {
+        // A job cancelled while it waited is dropped here, as one taken away is.
+        let Some(job) = jobs.get_mut(id).filter(|job| job.state == Stage::Queued) else {
             return;
         };
         job.state = Stage::Running;
         job.started = Some(Instant::now());
+        // Under the lock, so that a cancel of this job, which takes the lock to see it running,
+        // comes after the flag of the run before it is cleared.
+        crate::generation::starting();
         (job.arguments.clone(), job.output)
     };
     println!("generation {id} begins");
-    crate::generation::starting();
-    let generated = match output {
-        Output::Video => crate::generate::run(&arguments, USAGE),
-        Output::Picture => crate::image::run(&arguments),
-    };
+    let generated = run(&arguments, output);
     let mut jobs = server.jobs.lock().expect("the jobs");
     let Some(job) = jobs.get_mut(id) else {
         return;
@@ -397,6 +412,10 @@ fn generate(server: &Server, id: &str) {
         Ok(()) => {
             job.state = Stage::Done;
             println!("generation {id} wrote {}", job.written.display());
+        }
+        Err(error) if error.is::<crate::generation::Cancelled>() => {
+            job.state = Stage::Cancelled;
+            println!("generation {id} was cancelled");
         }
         Err(error) => {
             job.state = Stage::Failed;
@@ -566,9 +585,9 @@ async fn read_fields(
     Ok(())
 }
 
-/// Takes a generation away, with whatever it wrote. A generation that is running is left alone:
-/// stopping one half way is not something this can do yet, and throwing away what it is about to
-/// write while it writes is worse than waiting.
+/// Takes a generation away, with whatever it wrote. A generation that is running is left alone,
+/// since throwing away what it is about to write while it writes is worse than waiting: cancel it
+/// first.
 async fn forget(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
@@ -587,6 +606,23 @@ async fn forget(
         return Err(error.into());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Stops a generation: one waiting its turn is dropped from the queue, and one running stops at the
+/// boundary of its next step. Either keeps what it wrote, and is `cancelled` once it has stopped.
+async fn cancel(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Response, Failure> {
+    let mut jobs = server.jobs.lock().expect("the jobs");
+    let job = jobs.get_mut(&id).ok_or_else(Failure::unknown)?;
+    match job.state {
+        Stage::Queued => job.state = Stage::Cancelled,
+        Stage::Running => crate::generation::cancel(),
+        Stage::Cancelled => {}
+        Stage::Done | Stage::Failed => return Err(Failure::gone("that generation has ended")),
+    }
+    Ok((StatusCode::ACCEPTED, Json(job.describe(&id))).into_response())
 }
 
 /// Every generation this server has been asked for, the most recent first.
@@ -720,7 +756,7 @@ async fn events(
             // to say about it.
             let (state, described) = described?;
             if watch.said.as_ref() != Some(&described) {
-                watch.ended = matches!(state, Stage::Done | Stage::Failed);
+                watch.ended = state.ended();
                 watch.said = Some(described.clone());
                 return Some((Ok(Event::default().data(described.to_string())), watch));
             }
@@ -775,6 +811,7 @@ async fn written(
         )
             .into_response()),
         Stage::Failed => Err(Failure::gone("that generation failed")),
+        Stage::Cancelled => Err(Failure::gone("that generation was cancelled")),
         _ => Err(Failure::waiting()),
     }
 }
@@ -925,6 +962,120 @@ impl IntoResponse for Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server with no generating thread, whose queue is handed back for a test to run.
+    fn test_server(name: &str) -> (Arc<Server>, std::sync::mpsc::Receiver<String>) {
+        let directory =
+            std::env::temp_dir().join(format!("mmh3-server-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let (queue, waiting) = channel();
+        let server = Arc::new(Server {
+            jobs: Mutex::new(HashMap::new()),
+            queue,
+            defaults: Vec::new(),
+            image_defaults: Vec::new(),
+            models: None,
+            ffmpeg: None,
+            container: Container::Mp4,
+            directory,
+        });
+        (server, waiting)
+    }
+
+    fn block<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    /// The status and the JSON body of an answer.
+    fn answer(response: Result<Response, Failure>) -> (StatusCode, serde_json::Value) {
+        let response = response.unwrap_or_else(IntoResponse::into_response);
+        let status = response.status();
+        let bytes = block(axum::body::to_bytes(response.into_body(), usize::MAX)).unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    fn queue_picture(server: &Server) -> String {
+        let id = next_id();
+        let directory = server.directory.join(&id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let written = directory.join("image.png");
+        queue_job(
+            server,
+            id.clone(),
+            Output::Picture,
+            Vec::new(),
+            directory,
+            written,
+        )
+        .map_err(|_| "queued")
+        .unwrap();
+        id
+    }
+
+    fn state(server: &Server, id: &str) -> &'static str {
+        server.jobs.lock().unwrap()[id].state.name()
+    }
+
+    #[test]
+    fn a_cancelled_generation_stops_where_it_is() {
+        let (server, waiting) = test_server("cancel");
+        let running = queue_picture(&server);
+        let queued = queue_picture(&server);
+
+        // One waiting its turn is cancelled at once and never runs.
+        let (status, body) = answer(block(cancel(
+            State(Arc::clone(&server)),
+            Path(queued.clone()),
+        )));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["state"], "cancelled");
+
+        // One running stops at the next step boundary it reaches.
+        assert_eq!(waiting.recv().unwrap(), running);
+        generate(&server, &running, |_, _| {
+            assert_eq!(state(&server, &running), "running");
+            crate::generation::check_cancelled()?;
+            let (status, body) = answer(block(cancel(
+                State(Arc::clone(&server)),
+                Path(running.clone()),
+            )));
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(body["state"], "running");
+            crate::generation::check_cancelled()?;
+            unreachable!("the run was cancelled");
+        });
+        assert_eq!(state(&server, &running), "cancelled");
+
+        assert_eq!(waiting.recv().unwrap(), queued);
+        generate(&server, &queued, |_, _| {
+            unreachable!("a cancelled job runs")
+        });
+        assert_eq!(state(&server, &queued), "cancelled");
+
+        // The next run starts with the flag down, and one that has ended cannot be cancelled.
+        let done = queue_picture(&server);
+        generate(&server, &done, |_, _| {
+            crate::generation::check_cancelled()?;
+            Ok(())
+        });
+        assert_eq!(state(&server, &done), "done");
+        let (status, _) = answer(block(cancel(
+            State(Arc::clone(&server)),
+            Path(done.clone()),
+        )));
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = answer(block(cancel(
+            State(Arc::clone(&server)),
+            Path("nothing".to_owned()),
+        )));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&server.directory).unwrap();
+    }
 
     #[test]
     fn a_request_gives_what_to_generate_and_not_the_machine() {
