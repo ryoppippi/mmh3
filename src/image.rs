@@ -24,7 +24,7 @@ pub const USAGE: &str = "usage:
   mmh3 image (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <image.png> [--models DIR]
              [--reference FILE]... [--width N] [--height N] [--min-generation-area PIXELS] [--seed N]
              [--dit FILE] [--text-encoder FILE] [--vae FILE] [--save-latent <latent.safetensors>]
-             [--save-context <text.safetensors>]
+             [--save-context <text.safetensors>] [--preview-dir DIR]
              [--attention-precision PRECISION] [--linear-precision PRECISION] [--vram-budget GB] [--consistent]
              [--attention dense|sol] [--sparse-tau X] [--sparse-start X] [--draft-steps N] [--latent-upscaler FILE]
              [--renoise-sigma X] [--steps N] [--shift X] [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge]
@@ -53,7 +53,9 @@ checkpoint was distilled for, as a few-step LoRA such as PDMD's wants. A step th
 of the distilled sigmas it spans, weighted by how much of it each one covers. --patch and --lora apply as they do to
 mmh3 generate.
 --save-context also writes the text encoder's states of the prompt, which --context takes in place of the prompt
-and its encoder on the next run.";
+and its encoder on the next run.
+--preview-dir writes DIR/step-N.png after each step N: the picture that step predicts, mapped from its latent
+without the VAE at twice the latent's size, an eighth of the canvas, or of the half-size canvas of a draft step.";
 
 /// The DiT of MiniMax H3 Image inside the models directory.
 pub const IMAGE_DIT_FILE: &str =
@@ -81,6 +83,9 @@ const STEP_ROOM_PER_PIXEL: usize = 256;
 /// The most reference pictures an edit takes.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 const MAX_REFERENCES: usize = 16;
+/// How many pixels a side a latent pixel of a preview takes.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+const PREVIEW_SCALE: usize = 2;
 /// Bounds of a reference's short edge for the VAE's encoder and for the vision tower.
 const REFERENCE_SHORT_EDGE: (usize, usize) = (1024, 2048);
 const VISION_SHORT_EDGE: usize = 1024;
@@ -238,6 +243,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "vae",
             "save-latent",
             "save-context",
+            "preview-dir",
             "attention-precision",
             "linear-precision",
             "vram-budget",
@@ -330,6 +336,10 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("--shift shifts the grid of --steps".into());
     }
     let shift = option_float(&options, "shift", DEFAULT_SHIFT)?;
+    let preview_directory = options.get("preview-dir").map(Path::new);
+    if let Some(directory) = preview_directory {
+        std::fs::create_dir_all(directory)?;
+    }
 
     let prompt = match (options.get("prompt"), options.get("prompt-file")) {
         (Some(prompt), None) => Some((*prompt).to_owned()),
@@ -557,6 +567,9 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 return prepared.forward(&inputs, &[], step_sparse.as_ref());
             })?;
             let (sigma, sigma_next) = (sigmas[step], sigmas[step + 1]);
+            if let Some(directory) = preview_directory {
+                write_preview(directory, step + 1, &latent, &outputs.video, sigma)?;
+            }
             // The enlargement after the last draft step says its own time, so the step leaves it
             // out.
             let mut enlarging = 0.0;
@@ -1212,6 +1225,39 @@ fn whole_patches(latent: &Tensor) -> Tensor {
 #[cfg(not(any(feature = "cuda", feature = "metal")))]
 pub fn run(_arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Err("image needs a build with CUDA or Metal".into())
+}
+
+/// Writes the preview of step `step`, the clean latent that the velocity from `latent` at `sigma`
+/// predicts, to `directory/step-N.png`. It is written beside and then renamed, so that a server
+/// handing out the latest preview never hands out half of one.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn write_preview(
+    directory: &Path,
+    step: usize,
+    latent: &Tensor,
+    velocity: &[f32],
+    sigma: f32,
+) -> Result<(), Box<dyn Error>> {
+    use mmh3_core::preview::PICTURE_PREVIEW;
+
+    let (height, width) = (latent.shape[2], latent.shape[3]);
+    let bytes = PICTURE_PREVIEW.render(&latent.data, velocity, sigma, height, width, PREVIEW_SCALE);
+    let picture = image::RgbImage::from_raw(
+        (width * PREVIEW_SCALE) as u32,
+        (height * PREVIEW_SCALE) as u32,
+        bytes,
+    )
+    .ok_or("the preview has the wrong size")?;
+    let path = directory.join(preview_name(step));
+    let partial = directory.join(format!(".{}", preview_name(step)));
+    picture.save_with_format(&partial, image::ImageFormat::Png)?;
+    std::fs::rename(&partial, &path)?;
+    Ok(())
+}
+
+/// The file name of the preview of step `step`, counted from 1.
+pub fn preview_name(step: usize) -> String {
+    format!("step-{step}.png")
 }
 
 /// Writes pixels `[3, 1, height, width]` in [0, 1] as an 8-bit RGB PNG of `width × height`,

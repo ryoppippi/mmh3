@@ -8,6 +8,7 @@ pub mod mapped_file;
 pub mod media;
 pub mod numeric;
 pub mod picture;
+pub mod preview;
 pub mod random;
 pub mod safetensors;
 pub mod shard;

@@ -165,6 +165,26 @@ A 4096×4096 picture decodes in 2.4 s rather than 2.6 s, since the FP16 products
 already run close to the INT8 ones on a GB10. `mmh3 image` keeps decoding with the FP16 picture VAE
 unless `--vae` names the INT8 one, and a server's `--image-vae` does the same for its pictures.
 
+## latent_preview.py
+
+Fits the linear map from a latent pixel of MiniMax H3 Image to RGB that `mmh3 image --preview-dir`
+draws its step previews with, `PICTURE_PREVIEW` in `crates/mmh3-core/src/preview.rs`. It takes the
+final latents of `--save-latent` with the pictures of the same runs, fits the map to the mean of the
+16×16 pixels each latent pixel decodes to, and prints the PSNR of each pair and the weights:
+
+```sh
+for name in panda city beach portrait desert still forest kitchen; do
+  target/release/mmh3 image --prompt-file prompts/$name.txt --out pairs/$name.png \
+    --save-latent pairs/$name.safetensors
+done
+uv run tools/models/latent_preview.py pairs panda city beach portrait desert still \
+  --held-out forest kitchen
+```
+
+The map in mmh3 is fitted on six 2048×2048 pictures, of a red panda, a city street at night, a
+lagoon from above, a portrait, desert dunes and a still life, and comes 26.7 and 28.1 dB from the
+averages of an autumn forest and a kitchen it was not fitted on.
+
 ## taomate_lora.py
 
 Converts the [TaoMate-H3](https://huggingface.co/TaoLiveAIGC/TaoMate-H3) adapter into a ComfyUI
