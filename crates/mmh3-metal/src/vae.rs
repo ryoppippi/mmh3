@@ -370,7 +370,7 @@ impl MetalVideoDecoder {
         w.device.run(
             "video_unpatch",
             &[&projected.buffer, &pixels.buffer],
-            &[pixels.len() as u32, f as u32, h as u32, wp as u32],
+            &[pixels.len() as u32, f as u32, h as u32, wp as u32, 4, 1],
             pixels.len(),
             false,
         )?;

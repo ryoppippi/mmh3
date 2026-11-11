@@ -471,15 +471,18 @@ kernel void audio_geglu(device const float *gate [[buffer(0)]],
     y[i] = 0.5f * x * (1 + tanh(inner)) * value[i];
 }
 
+// Tokens of p[4] frames × 16 × 16 RGB pixels into planar [tiles][3][frames][height][width]. The
+// p[5] tiles' tokens interleave, a row a tile for each token, as tiles decoded together lie.
 kernel void video_unpatch(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
                           constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= p[0])
         return;
-    uint w = p[3], h = p[2], f = p[1];
-    uint col = i % w, row = i / w % h, t = i / (w * h) % f, c = i / (w * h * f);
-    uint token = ((t / 4) * (h / 16) + row / 16) * (w / 16) + col / 16;
-    uint feature = c * 1024 + t % 4 * 256 + row % 16 * 16 + col % 16;
-    y[i] = x[token * 3072 + feature];
+    uint w = p[3], h = p[2], f = p[1], pt = p[4], tiles = p[5];
+    uint col = i % w, row = i / w % h, t = i / (w * h) % f, c = i / (w * h * f) % 3,
+         tile = i / (w * h * f * 3);
+    uint token = ((t / pt) * (h / 16) + row / 16) * (w / 16) + col / 16;
+    uint feature = c * pt * 256 + t % pt * 256 + row % 16 * 16 + col % 16;
+    y[i] = x[(token * tiles + tile) * 3 * pt * 256 + feature];
 }
 
 // Write only the region owned by this tile. Neighbors are the original, unblended
