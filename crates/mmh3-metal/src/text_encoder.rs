@@ -11,7 +11,7 @@ use crate::{
     vision::VisionEmbeddings,
 };
 use mmh3_core::{
-    safetensors::{DType, SafeTensors},
+    safetensors::{DType, SafeTensors, is_comfy_metadata},
     streaming::{Arrangement, Files, give_up_order},
     tensor::Tensor,
     vision::VisionPrompt,
@@ -94,7 +94,7 @@ impl MetalTextEncoder {
             let Some(layer) = layer_of(name) else {
                 continue;
             };
-            if name.ends_with(".comfy_quant") {
+            if is_comfy_metadata(name) {
                 continue;
             }
             while units.len() <= layer {

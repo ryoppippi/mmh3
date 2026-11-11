@@ -127,6 +127,12 @@ impl From<io::Error> for Error {
     }
 }
 
+/// ComfyUI's notes beside the weights rather than weights: `.comfy_quant` describes a layer's
+/// quantization, and `.comfy_attention.config` is a hint for ComfyUI's attention.
+pub fn is_comfy_metadata(name: &str) -> bool {
+    name.ends_with(".comfy_quant") || name.ends_with(".comfy_attention.config")
+}
+
 fn format_error(message: impl Into<String>) -> Error {
     Error::Format(message.into())
 }

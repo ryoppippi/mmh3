@@ -20,7 +20,7 @@ use mmh3_core::{
         veda::VedaPredictor,
         vsa::VsaPlan,
     },
-    safetensors::SafeTensors,
+    safetensors::{SafeTensors, is_comfy_metadata},
     shard::{ExchangeError, Region, VelocityRows, regions as shard_regions},
     streaming::{Arrangement, Files, Unit, give_up_order},
     tensor::Tensor,
@@ -130,7 +130,7 @@ impl MetalDit {
             let Some(name) = info.name.strip_prefix(prefix) else {
                 continue;
             };
-            if name.ends_with(".comfy_quant") {
+            if is_comfy_metadata(name) {
                 continue;
             }
             if let Some(unit) = Self::unit_index(&config, name) {

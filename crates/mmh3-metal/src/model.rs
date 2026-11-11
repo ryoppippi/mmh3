@@ -5,7 +5,7 @@ use crate::{
 use mmh3_core::{
     json,
     numeric::f32_to_f16,
-    safetensors::{DType, SafeTensors, TensorInfo},
+    safetensors::{DType, SafeTensors, TensorInfo, is_comfy_metadata},
     streaming::{Arrangement, Files, UnitReader},
     tensor::Tensor,
 };
@@ -157,7 +157,8 @@ impl Weights {
                         "{name}: unsupported quantization {text}"
                     )));
                 }
-
+            }
+            if is_comfy_metadata(name) {
                 continue;
             }
 
