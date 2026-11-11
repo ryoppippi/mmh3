@@ -1,0 +1,9 @@
+{"events": [
+  {"t": 0.5, "type": "tap", "key": "size-4"},
+  {"t": 0.7, "type": "tap", "key": "prompt"},
+  {"t": 0.8, "type": "type", "text": "A lighthouse on a basalt cliff at dusk"},
+  {"t": 2.6, "type": "key", "name": "Enter", "cmd": true},
+  {"t": 2.7, "type": "mark", "name": "sent"},
+  {"t": 3.2, "type": "tap", "key": "randomise-seed"},
+  {"t": 3.4, "type": "tap", "key": "generate"}
+]}

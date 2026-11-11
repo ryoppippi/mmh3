@@ -8,6 +8,7 @@ mod gallery;
 mod icons;
 mod net;
 mod preview;
+mod scenes;
 mod state;
 mod view;
 
@@ -52,6 +53,7 @@ fn on_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
 fn spec() -> AppSpec<State> {
     AppSpec {
         min_size: Some((1040.0, 680.0)),
+        scenes: scenes::SCENES,
         poll: Some(poll),
         on_key: Some(on_key),
         ..AppSpec::new("mmh3 studio", (1320.0, 860.0), State::offline, view::view)
@@ -81,3 +83,6 @@ fn main() {
         })
         .run();
 }
+
+#[cfg(test)]
+mod tests;
