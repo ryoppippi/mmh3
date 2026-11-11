@@ -65,10 +65,8 @@ pub const IMAGE_VAE_FILE: &str = "vae/minimax_h3_image_vae_fp16.safetensors";
 /// Prompt tokens the reference keeps.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 const MAX_PROMPT_TOKENS: usize = 4096;
-#[cfg(any(feature = "cuda", feature = "metal"))]
-const DEFAULT_SIDE: usize = 2048;
-#[cfg(any(feature = "cuda", feature = "metal"))]
-const DEFAULT_MIN_GENERATION_AREA: usize = 2048 * 2048;
+pub const DEFAULT_SIDE: usize = 2048;
+pub const DEFAULT_MIN_GENERATION_AREA: usize = 2048 * 2048;
 /// The shift of the grid of `--steps`, the one PDMD's LoRA was distilled on.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 const DEFAULT_SHIFT: f32 = 12.0;
@@ -211,8 +209,45 @@ pub fn step_schedule(step_sigmas: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+/// What a picture's run has done so far, which it hands whoever runs it after each change.
+#[derive(Clone, Debug, Default)]
+pub struct Report {
+    pub timings: Timings,
+    /// The last step whose preview is written, counted from 1.
+    pub preview_step: Option<usize>,
+    /// The checkpoints the run read.
+    pub models: Vec<std::path::PathBuf>,
+    /// The attention precision the DiT runs, by the name `--attention-precision` gives it.
+    pub attention_precision: Option<&'static str>,
+}
+
+/// The seconds each stage of a picture took, or None for a stage it skipped or has not reached.
+#[derive(Clone, Debug, Default)]
+pub struct Timings {
+    /// Reading the text encoder, where it was not already loaded.
+    pub load_text: Option<f64>,
+    /// Encoding the prompt and the references.
+    pub encode: Option<f64>,
+    pub load_dit: Option<f64>,
+    pub steps: Vec<f64>,
+    /// Waiting for the picture VAE after the steps, which reads during them.
+    pub decode_read: Option<f64>,
+    /// The decode and bringing its pixels back.
+    pub decode: Option<f64>,
+    pub write: Option<f64>,
+}
+
+/// `mmh3 image`.
 pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    run_watched(arguments, &mut |_| {})
+}
+
+/// `mmh3 image`, handing `watch` the run's report each time it changes.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn run_watched(
+    arguments: &[String],
+    watch: &mut dyn FnMut(&Report),
+) -> Result<(), Box<dyn Error>> {
     use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::sampler::{Schedule, euler_step};
     use mmh3_core::generation::VIDEO_LATENT_CHANNELS;
@@ -340,6 +375,10 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if let Some(directory) = preview_directory {
         std::fs::create_dir_all(directory)?;
     }
+    let mut report = Report {
+        attention_precision: Some(attention_precision_name(&options)?),
+        ..Report::default()
+    };
 
     let prompt = match (options.get("prompt"), options.get("prompt-file")) {
         (Some(prompt), None) => Some((*prompt).to_owned()),
@@ -371,6 +410,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         (Some(prompt), None) => {
             let started = Instant::now();
             let path = option_path(&options, "text-encoder", TEXT_ENCODER_FILE)?;
+            report.models.push(path.clone().into());
             let mut ids = Tokenizer::h3().encode(&prompt);
             ids.truncate(MAX_PROMPT_TOKENS);
             let key = crate::resident::ContextKey {
@@ -396,7 +436,11 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                         Held::Alone => crate::metal::attention_precision(&options)?,
                         Held::Kept(_) => crate::metal::default_attention_precision(),
                     };
+                    // The encoder is in hand when the work starts, which splits its read from
+                    // the encode.
+                    let loaded = std::cell::Cell::new(None);
                     let (context, modalities) = held.text_encoder(&path, &options, |encoder| {
+                        loaded.set(Some(Instant::now()));
                         if references.is_empty() {
                             return Ok((encoder.encode(&ids, &[])?.context, Vec::new()));
                         }
@@ -429,6 +473,10 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                         let context = encoder.encode_prompt(&prompt, &embeddings, &[])?.context;
                         Ok((context, prompt.modalities))
                     })?;
+                    let loaded = loaded.get().unwrap_or(started);
+                    report.timings.load_text = Some((loaded - started).as_secs_f64());
+                    report.timings.encode = Some(loaded.elapsed().as_secs_f64());
+                    watch(&report);
                     println!(
                         "encoded {} prompt tokens with {} pictures in {:.1} s",
                         context.shape[0],
@@ -473,11 +521,31 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         )?;
         println!("wrote the context {:?} to {path}", context.shape);
     }
+    let started = Instant::now();
     let references = encode_references(&options, seed, &references)?;
+    if !references.is_empty() {
+        let seconds = started.elapsed().as_secs_f64();
+        report.timings.encode = Some(report.timings.encode.unwrap_or(0.0) + seconds);
+        watch(&report);
+    }
     held.make_room(&options, canvas_width * canvas_height)?;
 
     crate::generation::check_cancelled()?;
+    let started = Instant::now();
     let (mut dit, dit_key) = held.dit(&options)?;
+    report
+        .models
+        .push(option_path(&options, "dit", IMAGE_DIT_FILE)?.into());
+    for (name, folders) in [
+        ("patch", &["patches", "loras"][..]),
+        ("lora", &["loras"][..]),
+    ] {
+        if let Some(path) = crate::models::model_file(&options, name, folders)? {
+            report.models.push(path.into());
+        }
+    }
+    report.timings.load_dit = Some(started.elapsed().as_secs_f64());
+    watch(&report);
     let config = dit.config();
     if config.has_audio() || config.step_sigmas.is_empty() {
         return Err(
@@ -537,6 +605,12 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "sampling {canvas_width}×{canvas_height} in {steps} steps, {draft_steps} at half size"
     );
     let vae_path = option_path(&options, "vae", IMAGE_VAE_FILE)?;
+    report.models.push(vae_path.clone().into());
+    if let Some(path) =
+        crate::models::model_file(&options, "latent-upscaler", &["latent_upscale_models"])?
+    {
+        report.models.push(path.into());
+    }
     let vae_ahead = held.read_decoder_ahead(&vae_path, &options)?;
     // A run that stops early, asked to or not, still hands a kept DiT back to the table and waits
     // for the picture VAE it is reading, so that the run after it finds both where they belong.
@@ -569,6 +643,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let (sigma, sigma_next) = (sigmas[step], sigmas[step + 1]);
             if let Some(directory) = preview_directory {
                 write_preview(directory, step + 1, &latent, &outputs.video, sigma)?;
+                report.preview_step = Some(step + 1);
             }
             // The enlargement after the last draft step says its own time, so the step leaves it
             // out.
@@ -608,6 +683,8 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 steps,
                 seconds,
             });
+            report.timings.steps.push(seconds);
+            watch(&report);
         }
         crate::generation::check_cancelled()?;
         Ok(())
@@ -642,7 +719,13 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "decoded the picture with {vae_path} in {:.1} s: {timing}",
         started.elapsed().as_secs_f64()
     );
+    report.timings.decode_read = Some(timing.ready);
+    report.timings.decode = Some(timing.decoded + timing.read_back);
+    watch(&report);
+    let started = Instant::now();
     write_png(&pixels, width, height, out)?;
+    report.timings.write = Some(started.elapsed().as_secs_f64());
+    watch(&report);
     println!("wrote {}", out.display());
     Ok(())
 }
@@ -926,6 +1009,7 @@ impl Held {
                     None => load_decoder(&file, decoder_precision(options)?)?,
                 };
                 timing.read += read.elapsed().as_secs_f64();
+                timing.ready = waited.elapsed().as_secs_f64();
                 decode_timed(&decoder, latent)?
             }
             Held::Kept(table) => {
@@ -933,6 +1017,7 @@ impl Held {
                 table.with_room(|models| {
                     let decoder = models.picture_decoder(Path::new(path), key)?;
                     timing.read += read.elapsed().as_secs_f64();
+                    timing.ready = waited.elapsed().as_secs_f64();
                     decode_timed(decoder, latent)
                 })?
             }
@@ -962,6 +1047,8 @@ type DecoderRead =
 struct DecodeTiming {
     read: f64,
     waited: f64,
+    /// From the end of the steps until the decoder was in hand.
+    ready: f64,
     decoded: f64,
     read_back: f64,
 }
@@ -1122,6 +1209,24 @@ fn wanted_adapters(
     Ok(adapters)
 }
 
+/// The name of the attention precision the DiT runs, as `--attention-precision` gives it.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn attention_precision_name(
+    options: &std::collections::HashMap<&str, &str>,
+) -> Result<&'static str, Box<dyn Error>> {
+    #[cfg(feature = "metal")]
+    return Ok(match crate::metal::attention_precision(options)? {
+        mmh3_metal::AttentionPrecision::Fp32 => "fp32",
+        mmh3_metal::AttentionPrecision::Fp16 => "fp16",
+        mmh3_metal::AttentionPrecision::Int8 => "int8-fp16",
+    });
+    #[cfg(feature = "cuda")]
+    Ok(match attention_precision(options)? {
+        mmh3_cuda::attention::AttentionPrecision::Bf16 => "bf16",
+        mmh3_cuda::attention::AttentionPrecision::Int8Fp8 => "int8-fp8",
+    })
+}
+
 /// The attention precision of `--attention-precision`, BF16 by default.
 #[cfg(feature = "cuda")]
 fn attention_precision(
@@ -1223,7 +1328,10 @@ fn whole_patches(latent: &Tensor) -> Tensor {
 }
 
 #[cfg(not(any(feature = "cuda", feature = "metal")))]
-pub fn run(_arguments: &[String]) -> Result<(), Box<dyn Error>> {
+pub fn run_watched(
+    _arguments: &[String],
+    _watch: &mut dyn FnMut(&Report),
+) -> Result<(), Box<dyn Error>> {
     Err("image needs a build with CUDA or Metal".into())
 }
 
