@@ -1,0 +1,7 @@
+{
+  "generating": null,
+  "generations": 7,
+  "memory": {"free": 57481990144, "total": 130660909056},
+  "models": ["text_encoder", "dit", "image_vae"],
+  "queued": 0
+}

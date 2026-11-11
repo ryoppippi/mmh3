@@ -1,0 +1,6 @@
+[
+{"error":null,"height":2048,"id":"7c01aa2e0005","kind":"image","prompt":"Paper boats on a rain puddle","queued":1794393100,"seconds":null,"seed":12,"state":"running","step":3,"steps":6,"width":2048},
+{"error":"width must be a multiple of 32","height":1000,"id":"7c01aa2e0004","kind":"image","prompt":"Bad size","queued":1794393050,"seconds":0.01,"seed":1,"state":"failed","step":null,"steps":null,"width":1000},
+{"error":null,"height":3072,"id":"7c01aa2e0003","kind":"image","prompt":"A lighthouse on a basalt cliff at dusk, long exposure","queued":1794393000,"seconds":14.62,"seed":4127,"state":"done","step":null,"steps":null,"timings":{"decode":2.31,"steps":[1.98,1.97,1.99,1.97,1.98,1.96],"text":0.46},"width":5472},
+{"error":null,"id":"6ab1cf3b0000","queued":1790037819,"seconds":10.9,"state":"done","step":null,"steps":null}
+]
