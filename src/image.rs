@@ -347,6 +347,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if references.len() > MAX_REFERENCES {
         return Err(format!("pass at most {MAX_REFERENCES} --reference pictures").into());
     }
+    crate::generation::check_cancelled()?;
     let mut held = match crate::generation::keeps_models() {
         true => Held::Kept(crate::resident::Table::new(
             crate::resident::current_device(),
@@ -465,6 +466,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let references = encode_references(&options, seed, &references)?;
     held.make_room(&options, canvas_width * canvas_height)?;
 
+    crate::generation::check_cancelled()?;
     let (mut dit, dit_key) = held.dit(&options)?;
     let config = dit.config();
     if config.has_audio() || config.step_sigmas.is_empty() {
@@ -526,68 +528,82 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     );
     let vae_path = option_path(&options, "vae", IMAGE_VAE_FILE)?;
     let vae_ahead = held.read_decoder_ahead(&vae_path, &options)?;
-    // Metal refines the prompt once for every step.
-    #[cfg(feature = "metal")]
-    let prepared = held.with_room(|| dit.prepare_text(&inputs.context))?;
-    for step in 0..steps {
-        let started = Instant::now();
-        // Draft steps fall short of the length below which Sol-Attn stays dense. Their layout is
-        // redrawn at full size, so they go sparse anyway.
-        let step_sparse = sparse
-            .map(|sparse| match step < draft_steps {
-                true => mmh3_core::dit::sparse::SparseAttention {
-                    min_tokens: 0,
-                    ..sparse
-                },
-                false => sparse,
-            })
-            .filter(|sparse| sparse.applies_to_step(step, steps));
-        inputs.video = latent.clone();
-        inputs.sigma = sigmas[step];
-        let outputs = held.with_room(|| {
-            #[cfg(feature = "cuda")]
-            return dit.forward(&inputs, &[], step_sparse.as_ref());
-            #[cfg(feature = "metal")]
-            return prepared.forward(&inputs, &[], step_sparse.as_ref());
-        })?;
-        let (sigma, sigma_next) = (sigmas[step], sigmas[step + 1]);
-        // The enlargement after the last draft step says its own time, so the step leaves it out.
-        let mut enlarging = 0.0;
-        if step + 1 == draft_steps {
-            // The clean latent the draft predicts, enlarged to the full canvas and noised to the
-            // next sigma with fresh noise of the seed, starts the steps at full size.
-            for (value, &slope) in latent.data.iter_mut().zip(&outputs.video) {
-                *value -= sigma * slope;
+    // A run that stops early, asked to or not, still hands a kept DiT back to the table and waits
+    // for the picture VAE it is reading, so that the run after it finds both where they belong.
+    let sampled = (|| -> Result<(), Box<dyn Error>> {
+        // Metal refines the prompt once for every step.
+        #[cfg(feature = "metal")]
+        let prepared = held.with_room(|| dit.prepare_text(&inputs.context))?;
+        for step in 0..steps {
+            crate::generation::check_cancelled()?;
+            let started = Instant::now();
+            // Draft steps fall short of the length below which Sol-Attn stays dense. Their layout
+            // is redrawn at full size, so they go sparse anyway.
+            let step_sparse = sparse
+                .map(|sparse| match step < draft_steps {
+                    true => mmh3_core::dit::sparse::SparseAttention {
+                        min_tokens: 0,
+                        ..sparse
+                    },
+                    false => sparse,
+                })
+                .filter(|sparse| sparse.applies_to_step(step, steps));
+            inputs.video = latent.clone();
+            inputs.sigma = sigmas[step];
+            let outputs = held.with_room(|| {
+                #[cfg(feature = "cuda")]
+                return dit.forward(&inputs, &[], step_sparse.as_ref());
+                #[cfg(feature = "metal")]
+                return prepared.forward(&inputs, &[], step_sparse.as_ref());
+            })?;
+            let (sigma, sigma_next) = (sigmas[step], sigmas[step + 1]);
+            // The enlargement after the last draft step says its own time, so the step leaves it
+            // out.
+            let mut enlarging = 0.0;
+            if step + 1 == draft_steps {
+                // The clean latent the draft predicts, enlarged to the full canvas and noised to
+                // the next sigma with fresh noise of the seed, starts the steps at full size.
+                for (value, &slope) in latent.data.iter_mut().zip(&outputs.video) {
+                    *value -= sigma * slope;
+                }
+                let enlarged = Instant::now();
+                latent = crate::generation::enlarge_draft(
+                    &options,
+                    &latent,
+                    latent_height,
+                    latent_width,
+                )?;
+                enlarging = enlarged.elapsed().as_secs_f64();
+                let fresh = noise.samples(latent.data.len());
+                for (value, fresh) in latent.data.iter_mut().zip(fresh) {
+                    *value = (1.0 - sigma_next) * *value + sigma_next * fresh;
+                }
+            } else {
+                euler_step(&mut latent.data, &outputs.video, sigma, sigma_next);
             }
-            let enlarged = Instant::now();
-            latent =
-                crate::generation::enlarge_draft(&options, &latent, latent_height, latent_width)?;
-            enlarging = enlarged.elapsed().as_secs_f64();
-            let fresh = noise.samples(latent.data.len());
-            for (value, fresh) in latent.data.iter_mut().zip(fresh) {
-                *value = (1.0 - sigma_next) * *value + sigma_next * fresh;
-            }
-        } else {
-            euler_step(&mut latent.data, &outputs.video, sigma, sigma_next);
+            let routing = outputs.routed_fraction.map_or(String::new(), |fraction| {
+                format!(", Sol-Attn routed {:.1}%", 100.0 * fraction)
+            });
+            let draft = if step < draft_steps { " (draft)" } else { "" };
+            let seconds = started.elapsed().as_secs_f64() - enlarging;
+            println!(
+                "step {}/{steps}{draft} at sigma {sigma:.4} in {seconds:.1} s{routing}",
+                step + 1,
+            );
+            crate::generation::reached(crate::generation::Progress {
+                step: step + 1,
+                steps,
+                seconds,
+            });
         }
-        let routing = outputs.routed_fraction.map_or(String::new(), |fraction| {
-            format!(", Sol-Attn routed {:.1}%", 100.0 * fraction)
-        });
-        let draft = if step < draft_steps { " (draft)" } else { "" };
-        let seconds = started.elapsed().as_secs_f64() - enlarging;
-        println!(
-            "step {}/{steps}{draft} at sigma {sigma:.4} in {seconds:.1} s{routing}",
-            step + 1,
-        );
-        crate::generation::reached(crate::generation::Progress {
-            step: step + 1,
-            steps,
-            seconds,
-        });
-    }
-    #[cfg(feature = "metal")]
-    drop(prepared);
+        crate::generation::check_cancelled()?;
+        Ok(())
+    })();
     held.keep_dit(dit, dit_key);
+    if let Err(error) = sampled {
+        let _ = vae_ahead.thread.join();
+        return Err(error);
+    }
     #[cfg(feature = "cuda")]
     crate::models::save_algorithm_cache();
     if let Some(path) = options.get("save-latent") {

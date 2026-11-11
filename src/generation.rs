@@ -167,13 +167,43 @@ pub fn reached(progress: Progress) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(progress);
 }
 
+/// Whether the run here was asked to stop, which it does at its next step boundary.
+static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Forgets where the run before this one had got to, so that a run is not reported at a step it
-/// has not taken.
+/// has not taken, and that it was asked to stop.
 pub fn starting() {
     *PROGRESS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    CANCELLED.store(false, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// Asks the run here to stop at its next step boundary.
+pub fn cancel() {
+    CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Fails with [`Cancelled`] when the run here was asked to stop, for a run to call where it can
+/// stop without leaving anything half done.
+pub fn check_cancelled() -> Result<(), Cancelled> {
+    match CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
+        true => Err(Cancelled),
+        false => Ok(()),
+    }
+}
+
+/// The error of a run that stopped because it was asked to.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl Error for Cancelled {}
 
 /// The seed of the noise keyframes and reference pictures sample from the video VAE's posterior,
 /// as the reference pipeline fixes it.
@@ -936,6 +966,7 @@ pub fn sample(
             None => None,
         };
         for step in phase {
+            check_cancelled()?;
             let started = Instant::now();
             let inputs = DitInputs {
                 video: video.clone(),
