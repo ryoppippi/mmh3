@@ -3,6 +3,7 @@ name = "mmh3-studio"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+default-run = "mmh3-studio"
 
 [workspace]
 
