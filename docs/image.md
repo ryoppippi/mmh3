@@ -68,6 +68,7 @@ description of the whole picture, as in [Prompts](#prompts).
 - `--context FILE`: The text encoder states of a `text.safetensors` in place of a prompt.
 - `--save-context FILE`: Also writes the text encoder states of the prompt as such a file, which
   `--context` takes on the next run of the same prompt in place of the prompt and its encoder.
+- `--preview-dir DIR`: Also writes `DIR/step-N.png` after each step N, see [Previews](#previews).
 
 The six steps run on the sigmas the checkpoint was distilled for, with the output head of each
 step, and the picture VAE decodes in tiles of 256 pixels that overlap by at least 64, as the
@@ -152,6 +153,30 @@ single hairs. A higher `--renoise-sigma` redraws more of the draft and a lower o
 
 A step off the six distilled sigmas projects through the output heads of the distilled steps it
 spans, averaged by how much of it each one covers, as ComfyUI takes them.
+
+## Previews
+
+With `--preview-dir DIR`, each step writes `DIR/step-N.png`, a rough picture of where the
+generation is going: the clean latent the step predicts, `x − sigma · v`, mapped to RGB one latent
+pixel at a time by a linear map, at twice the latent's size, an eighth of the canvas, or of the
+half-size canvas of a [draft step](draft-steps.md). It needs no VAE, so it costs about 1 ms a step
+at 2048×2048 and 4 ms at 4096×4096, and the picture is the same with previews or without, bit for
+bit. The [server](server.md#asking-for-a-picture) writes them for every picture and hands them out
+as they come.
+
+The map is fitted by [tools/models](../tools/models/README.md#latent_previewpy) on six pictures
+against the decode averaged over the 16×16 pixels of each latent pixel, and comes 26.7 and 28.1 dB
+PSNR from such averages of two prompts it was not fitted on. The composition is drawn by the second
+step. For a 2048×2048 lighthouse at seed 7, also outside the fit, the preview of each step against
+the final picture averaged the same way:
+
+| Step | 1 | 2 | 3 | 4 | 5 | 6 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| PSNR | 17.7 dB | 22.0 dB | 25.0 dB | 27.2 dB | 28.1 dB | 28.1 dB |
+
+The first step is a blur of colours, the second has the lighthouse, the cliff, the sea and the
+light of the sky where the picture has them, and the later ones add the clouds, the gulls and the
+texture of the rock.
 
 ## Edit
 

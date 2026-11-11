@@ -48,17 +48,42 @@ curl -X POST http://localhost:8833/v1/generations \
 ```json
 {
   "id": "6ab1cf3b0000",
+  "kind": "video",
   "state": "queued",
   "queued": 1790037819,
   "seconds": null,
   "step": null,
   "steps": null,
-  "error": null
+  "error": null,
+  "request": {
+    "prompt": "A red panda sips tea on a sunny wooden porch while birds chirp in the garden.",
+    "width": null,
+    "height": null,
+    "seed": 2,
+    "min_generation_area": null,
+    "attention_precision": null,
+    "attention": null,
+    "sparse_tau": null,
+    "sparse_start": null,
+    "draft_steps": null,
+    "latent_upscaler": null,
+    "references": []
+  },
+  "created_at": 1790037819.52,
+  "started_at": null,
+  "finished_at": null,
+  "timings": null,
+  "preview_step": null
 }
 ```
 
-`state` is `queued`, `running`, `done` or `failed`, `seconds` is how long it took once it is one of
-the last two, and `error` says why it is `failed`.
+`state` is `queued`, `running`, `done`, `failed` or `cancelled`, `seconds` is how long it took once
+it has ended, and `error` says why it is `failed`. `kind` is `video` or `image`. `request` is what
+the request asked for: the prompt, from `prompt-file` when it came as a file, the names of its
+references and of its latent upscaler, and the attention, its precision, the draft steps and
+Sol-Attn's `sparse_tau` and `sparse_start` it asked for, with a picture's defaults where the request
+left an option out and `null` where a video's are its own or a setting has the backend's default. `created_at`, `started_at` and `finished_at` are Unix times in seconds.
+`timings` and `preview_step` are a picture's, see [Asking for a picture](#asking-for-a-picture).
 
 The answer is the generation rather than the video, which is not there yet. There is one generation
 at a time, which takes every GPU the machine has, and the rest wait their turn.
@@ -94,6 +119,32 @@ curl -X POST http://localhost:8833/v1/images \
 
 The answer is a generation like any other, which waits its turn with the videos and is watched the
 same way, and its picture is a PNG at `GET /v1/generations/{id}/image`.
+
+While it runs, a picture says how long each stage took in `timings`, in seconds, and fills in
+`attention_precision` with the precision its DiT runs at:
+
+```json
+{
+  "load_text": 1.07,
+  "encode": 0.29,
+  "load_dit": 7.48,
+  "steps": [4.22, 2.83, 3.00, 2.97, 3.18, 3.15],
+  "decode_read": 0.0004,
+  "decode": 1.18,
+  "write": 0.03
+}
+```
+
+`load_text` and `encode` are the text encoder's read and the encode of the prompt and the
+references, both `null` when the server kept the encoded prompt from an earlier picture.
+`decode_read` is how long the decode waited for the picture VAE, which is read during the steps.
+A stage not reached yet is `null`.
+
+After each step, a picture writes a preview of what that step predicts, mapped from its latent
+without the VAE at an eighth of the canvas, such as 256×256 for 2048×2048. See [Image](image.md#previews).
+`preview_step` is the last step with one, and `GET /v1/generations/{id}/preview` is its PNG, 404
+until the first step. `GET /v1/generations/{id}/preview/{step}` is the preview of a given step,
+counted from 1.
 
 A picture is generated on this machine's card, whatever `--worker` says, and keeps its text encoder,
 DiT and picture VAE in the same tables as the worker of the server. The text encoder is the one
@@ -135,6 +186,43 @@ data: {"error":null,"id":"6ab1cf3b0000","queued":1790037819,"seconds":10.9,"stat
 
 Asking again works as well, at `GET /v1/generations/{id}`, and says the same thing.
 
+## Watching every one
+
+```sh
+curl -N http://localhost:8833/v1/events
+```
+
+One stream for every generation of the server. It starts with a `snapshot`, which is what
+`GET /v1/generations` answers, and then says a `generation` with the whole generation whenever one
+changes state or step, and a `preview` whenever a picture has a new preview:
+
+```
+event: snapshot
+data: {"generations":[...]}
+
+event: generation
+data: {"id":"6af4fadf0000","kind":"image","state":"running","step":2,"steps":6,...}
+
+event: preview
+data: {"id":"6af4fadf0000","step":2,"steps":6,"url":"/v1/generations/6af4fadf0000/preview/2"}
+
+: keep-alive
+```
+
+A comment every 15 s keeps the stream alive while nothing happens. A client that falls too far
+behind is sent a new `snapshot` in place of what it missed. The stream does not end.
+
+## Cancelling one
+
+```sh
+curl -X POST http://localhost:8833/v1/generations/6ab1cf3b0000/cancel
+```
+
+This answers 202 and the generation. One waiting its turn is `cancelled` at once and never runs.
+One running stops at the boundary of its next step, or before the model it is reading next, and is
+`cancelled` once it has, which for a picture is within one step. A generation that has ended
+answers 409. A cancelled picture keeps the previews of the steps it took.
+
 ## Taking the video
 
 ```sh
@@ -143,6 +231,25 @@ curl http://localhost:8833/v1/generations/6ab1cf3b0000/video -o out.mp4
 
 The video is `video/webm` rather than `video/mp4` from a server started with `--format webm`. Until
 the generation is done this answers 409 rather than a video.
+
+## What a generation leaves behind
+
+Each generation has a directory of its own under the jobs directory, named by its id:
+
+- `image.png` or `video.mp4`, what it wrote.
+- `previews/step-N.png`, a picture's previews.
+- `references/`, the references the request uploaded, numbered when two share a name, and beside
+  them any other file the request uploaded.
+- `metadata.json`, the generation as `GET /v1/generations/{id}` describes it, with what made it:
+  `models`, the checkpoints it read as `{file, size, digest}`, `mmh3`, the `version` and the
+  `commit` of the build, and `machine`, the Mac's `model` and `chip`, its `memory_bytes`, its
+  `power_mode` (`automatic`, `low` or `high`) and its `adapter_watts`, `null` on battery.
+  `gpu_clock_mhz_median` is `null`, since only `powermetrics` reads the GPU's clock, as root.
+
+A server writes `metadata.json` as a generation starts and as it ends, and reads every one under the
+jobs directory back when it starts, so the generations of the server before it are listed again,
+the most recent first, and their pictures and previews are there to be taken. One that was waiting
+or running when that server stopped is `failed`, since it never ended.
 
 ## What a server holds
 
@@ -200,14 +307,18 @@ arrived:
 | `GET /v1/generations` | Every generation this server was asked for, the most recent first. |
 | `GET /v1/generations/{id}` | What one is doing, with the step it is on while it runs. |
 | `GET /v1/generations/{id}/events` | The same as it happens, as server-sent events. |
+| `GET /v1/events` | Every generation as it happens, with its previews, as server-sent events. |
+| `POST /v1/generations/{id}/cancel` | Stop one, at its next step if it is running. Answers 202 and the generation. |
 | `POST /v1/images` | Take a picture, as `multipart/form-data`. Answers 202 and the generation. |
 | `GET /v1/generations/{id}/video` | The video, once there is one. |
 | `GET /v1/generations/{id}/image` | The picture, once there is one. |
+| `GET /v1/generations/{id}/preview` | A picture's latest preview, once there is one. |
+| `GET /v1/generations/{id}/preview/{step}` | A picture's preview after step `step`. |
 | `DELETE /v1/generations/{id}` | Take one away with whatever it wrote. |
 | `GET /v1/status` | What this machine is doing and what it is holding. |
 
-A generation that is running is not taken away: `DELETE` answers 409 and leaves it. Stopping one
-half way is not something this does yet.
+A generation that is running is not taken away: `DELETE` answers 409 and leaves it. Cancel it
+first.
 
 ## Building it
 
