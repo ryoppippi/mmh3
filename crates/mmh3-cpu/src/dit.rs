@@ -1,4 +1,5 @@
-//! Text-to-video DiT forward pass: one model call on the packed `[text | audio | video]` sequence.
+//! Text-to-video DiT forward pass: one model call on the packed `[text | audio | video]` sequence,
+//! or `[text | image]` for a checkpoint without the audio stream.
 
 use mmh3_core::dit::config::DitConfig;
 use mmh3_core::dit::inputs::DitInputs;
@@ -292,7 +293,32 @@ impl Modulation {
     }
 }
 
+/// Head `step` of a bank of `outputs`-row heads stacked along the first axis, as ComfyUI's
+/// `_pdd_head` takes it for a step on one interval of the grid: the first head plus the step's
+/// offset from it.
+fn pdd_head(bank: &Tensor, outputs: usize, step: usize) -> Tensor {
+    let width = bank.data.len() / bank.shape[0];
+    let mut shape = bank.shape.clone();
+    shape[0] = outputs;
+    let first = &bank.data[..outputs * width];
+    let data = match step {
+        0 => first.to_vec(),
+        _ => first
+            .iter()
+            .zip(&bank.data[step * outputs * width..(step + 1) * outputs * width])
+            .map(|(&first, &offset)| first + offset)
+            .collect(),
+    };
+    Tensor::new(shape, data)
+}
+
 pub fn forward(weights: &DitWeights, config: &DitConfig, inputs: &DitInputs) -> DitTrace {
+    assert!(
+        inputs.pdd_step < config.pdd_steps,
+        "step {} of a bank of {} heads",
+        inputs.pdd_step,
+        config.pdd_steps
+    );
     let width = config.hidden;
     let video_shape = &inputs.video.shape;
     let layout = PackedLayout::for_inputs(inputs);
@@ -321,6 +347,9 @@ pub fn forward(weights: &DitWeights, config: &DitConfig, inputs: &DitInputs) -> 
     };
     let mut hidden = Vec::with_capacity(layout.len() * width);
     for segment in &layout.segments {
+        if segment.is_empty() {
+            continue;
+        }
         match segment.kind {
             SegmentKind::Text => hidden.extend_from_slice(&text_states),
             SegmentKind::KeyframeVideo(index) => {
@@ -422,8 +451,11 @@ pub fn forward(weights: &DitWeights, config: &DitConfig, inputs: &DitInputs) -> 
         2,
         width,
     );
-    let project = |kind: SegmentKind, head: &str| {
+    let project = |kind: SegmentKind, head: &str, step: usize| {
         let segment = layout.segment(kind);
+        if segment.is_empty() {
+            return Vec::new();
+        }
         let mut rows = hidden[segment.start * width..segment.end * width].to_vec();
         rms_norm(
             &mut rows,
@@ -441,14 +473,19 @@ pub fn forward(weights: &DitWeights, config: &DitConfig, inputs: &DitInputs) -> 
                 row[index] = row[index] * (1.0 + scale[index]) + shift[index];
             }
         }
-        linear(
-            &rows,
+        let (weight, bias) = (
             weights.get(&format!("final_layer.{head}.weight")),
-            Some(weights.get(&format!("final_layer.{head}.bias"))),
-        )
+            weights.get(&format!("final_layer.{head}.bias")),
+        );
+        let outputs = weight.shape[0] / config.pdd_steps;
+        let (weight, bias) = (
+            pdd_head(weight, outputs, step),
+            pdd_head(bias, outputs, step),
+        );
+        linear(&rows, &weight, Some(&bias))
     };
-    let video_rows = project(SegmentKind::Video, "video_out");
-    let audio_rows = project(SegmentKind::Audio, "audio_out");
+    let video_rows = project(SegmentKind::Video, "video_out", inputs.pdd_step);
+    let audio_rows = project(SegmentKind::Audio, "audio_out", inputs.pdd_step);
     let video = unpatchify_video(&video_rows, video_shape)
         .into_iter()
         .map(|value| -value)
