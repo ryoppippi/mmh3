@@ -84,8 +84,8 @@ Each generated a 672×384, 73-frame video, 3.0 seconds at 24 fps. On the M6, the
 - Videos from reference pictures, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
   DiT, reading reference clips from MP4 files.
 - Pictures from a prompt with [MiniMax-H3-Image](docs/image.md) work on Metal with `mmh3 image`,
-  checked against the reference implementations on small random models. It has not run on the
-  released weights yet.
+  checked against the reference implementations on small random models and run on the released
+  weights on an M5 Max, where a 2048×2048 picture took 29 s including model loading.
 - NVIDIA GPUs with CUDA. It is developed on a DGX Spark (GB10, `sm_121`) and builds for `sm_120f`,
   so it should also run on RTX PRO 6000 and RTX 50 series GPUs, which have not been tested yet. The
   build also targets Ada (`sm_89`), which runs on an RTX 4090.
