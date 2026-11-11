@@ -478,7 +478,19 @@ struct Server {
     ffmpeg: Option<Vec<String>>,
     container: Container,
     directory: PathBuf,
+    /// What the stream of every generation says next, as an event's name and its data.
+    announcements: tokio::sync::broadcast::Sender<Announcement>,
 }
+
+/// An event of `GET /v1/events`: its name and its data.
+type Announcement = (&'static str, serde_json::Value);
+
+/// How many events a client of `GET /v1/events` may fall behind by before it is sent a snapshot in
+/// place of the ones it missed.
+const ANNOUNCEMENTS: usize = 256;
+/// How often `GET /v1/events` says something to a client when nothing happens, so that a proxy
+/// between them does not take the stream for a dead one.
+const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 /// `mmh3 server [--listen ADDR] [--jobs DIR] ...`, which serves until it is stopped.
 pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -596,6 +608,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         ffmpeg: ffmpeg.map(<[String]>::to_vec),
         container,
         directory: directory.clone(),
+        announcements: tokio::sync::broadcast::channel(ANNOUNCEMENTS).0,
     });
 
     // The generations run here, one after another, off the runtime that answers the requests. A
@@ -623,10 +636,11 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .route("/v1/generations/{id}/image", get(image))
         .route("/v1/generations/{id}/preview", get(latest_preview))
         .route("/v1/generations/{id}/preview/{step}", get(preview))
+        .route("/v1/events", get(all_events))
         // Each field holds itself to FIELD_BYTES or FILE_BYTES as it is read, which axum's limit on
         // the whole body, 2 MB, would cut short of any picture worth editing.
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .with_state(server);
+        .with_state(Arc::clone(&server));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -634,6 +648,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(&listen).await?;
         println!("serving on {listen}, jobs in {}", directory.display());
+        tokio::spawn(announce(server));
         axum::serve(listener, application).await
     })?;
     Ok(())
@@ -907,6 +922,11 @@ async fn cancel(
 
 /// Every generation this server has been asked for, the most recent first.
 async fn list(State(server): State<Arc<Server>>) -> Response {
+    Json(generations(&server)).into_response()
+}
+
+/// `{generations: [...]}`, every generation the most recent first.
+fn generations(server: &Server) -> serde_json::Value {
     let jobs = server.jobs.lock().expect("the jobs");
     // Ids count up within a run of the server, which orders two asked for in the same instant.
     let mut described: Vec<(SystemTime, &String, serde_json::Value)> = jobs
@@ -917,7 +937,87 @@ async fn list(State(server): State<Arc<Server>>) -> Response {
         .sort_by(|(one, one_id, _), (other, other_id, _)| (other, other_id).cmp(&(one, one_id)));
     let generations: Vec<serde_json::Value> =
         described.into_iter().map(|(_, _, value)| value).collect();
-    Json(json!({ "generations": generations })).into_response()
+    json!({ "generations": generations })
+}
+
+/// What has changed of the server's generations since `said`, which is what was last said of
+/// each, as the events of `GET /v1/events`: a `generation` for each one that changed, and a
+/// `preview` for each with a new preview.
+fn changes(server: &Server, said: &mut HashMap<String, serde_json::Value>) -> Vec<Announcement> {
+    let jobs = server.jobs.lock().expect("the jobs");
+    said.retain(|id, _| jobs.contains_key(id));
+    let mut changes = Vec::new();
+    for (id, job) in jobs.iter() {
+        let described = job.describe(id);
+        let before = said.get(id);
+        if before == Some(&described) {
+            continue;
+        }
+        let preview_step = described["preview_step"].as_u64();
+        if preview_step.is_some()
+            && before.is_none_or(|before| before["preview_step"].as_u64() != preview_step)
+        {
+            changes.push((
+                "preview",
+                json!({
+                    "id": id,
+                    "step": preview_step,
+                    "steps": described["steps"],
+                    "url": format!("/v1/generations/{id}/preview/{}", preview_step.unwrap_or(0)),
+                }),
+            ));
+        }
+        changes.push(("generation", described.clone()));
+        said.insert(id.clone(), described);
+    }
+    // A generation's own change before the preview it brought, for a client that draws the
+    // preview of the step it was told of.
+    changes.sort_by_key(|(name, _)| *name == "preview");
+    changes
+}
+
+/// Tells the clients of `GET /v1/events` what changed, as often as a client watching one
+/// generation looks.
+async fn announce(server: Arc<Server>) {
+    let mut said = HashMap::new();
+    // What was there before anybody could listen is in every client's snapshot.
+    changes(&server, &mut said);
+    loop {
+        tokio::time::sleep(WATCH).await;
+        for announcement in changes(&server, &mut said) {
+            // Nobody listening is not a failure to say it.
+            let _ = server.announcements.send(announcement);
+        }
+    }
+}
+
+/// Every generation as it happens, in one stream: a `snapshot` of all of them first, then a
+/// `generation` whenever one changes and a `preview` whenever one has a new preview. A client
+/// that falls behind is sent another snapshot.
+async fn all_events(
+    State(server): State<Arc<Server>>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    use futures_util::StreamExt;
+
+    // Listening before the snapshot is taken, so that nothing falls between the two.
+    let listening = server.announcements.subscribe();
+    let snapshot = Event::default()
+        .event("snapshot")
+        .data(generations(&server).to_string());
+    let announcements = unfold((server, listening), |(server, mut listening)| async move {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let event = match listening.recv().await {
+            Ok((name, data)) => Event::default().event(name).data(data.to_string()),
+            Err(RecvError::Lagged(_)) => Event::default()
+                .event("snapshot")
+                .data(generations(&server).to_string()),
+            Err(RecvError::Closed) => return None,
+        };
+        Some((Ok(event), (server, listening)))
+    });
+    let events = futures_util::stream::once(std::future::ready(Ok(snapshot))).chain(announcements);
+    Sse::new(events).keep_alive(KeepAlive::new().interval(KEEP_ALIVE).text("keep-alive"))
 }
 
 /// What this machine is doing and what it is holding, for a client deciding whether to ask it for
@@ -1324,6 +1424,7 @@ mod tests {
             ffmpeg: None,
             container: Container::Mp4,
             directory,
+            announcements: tokio::sync::broadcast::channel(ANNOUNCEMENTS).0,
         });
         (server, waiting)
     }
@@ -1658,6 +1759,78 @@ mod tests {
         assert_eq!(listed, [&interrupted, &cancelled, &done]);
         std::fs::remove_dir_all(&server.directory).unwrap();
         std::fs::remove_dir_all(&again.directory).unwrap();
+    }
+
+    #[test]
+    fn one_stream_says_what_changes_of_every_generation() {
+        let (server, _waiting) = test_server("events");
+        let mut said = HashMap::new();
+        assert!(changes(&server, &mut said).is_empty());
+        let id = queue_picture(&server);
+        let announced = changes(&server, &mut said);
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].0, "generation");
+        assert_eq!(announced[0].1["id"], id.as_str());
+        assert_eq!(announced[0].1["state"], "queued");
+        assert!(changes(&server, &mut said).is_empty());
+
+        let report = crate::image::Report {
+            preview_step: Some(2),
+            ..Default::default()
+        };
+        server
+            .jobs
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .take_report(&report);
+        let announced = changes(&server, &mut said);
+        let names: Vec<&str> = announced.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["generation", "preview"]);
+        assert_eq!(announced[1].1["id"], id.as_str());
+        assert_eq!(announced[1].1["step"], 2);
+        assert_eq!(
+            announced[1].1["url"],
+            format!("/v1/generations/{id}/preview/2")
+        );
+        // A change that brings no new preview says only the generation.
+        server.jobs.lock().unwrap().get_mut(&id).unwrap().state = Stage::Cancelled;
+        let names: Vec<&str> = changes(&server, &mut said)
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(names, ["generation"]);
+        server.jobs.lock().unwrap().remove(&id);
+        assert!(changes(&server, &mut said).is_empty());
+        assert!(said.is_empty());
+
+        // The stream starts with a snapshot and goes on with what is announced.
+        let again = queue_picture(&server);
+        let body = block(async {
+            use futures_util::StreamExt;
+
+            let response = all_events(State(Arc::clone(&server))).await.into_response();
+            let mut frames = response.into_body().into_data_stream();
+            let first = frames.next().await.unwrap().unwrap();
+            server
+                .announcements
+                .send(("generation", json!({ "id": again })))
+                .unwrap();
+            let second = frames.next().await.unwrap().unwrap();
+            [first, second].map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+        });
+        assert!(
+            body[0].starts_with("event: snapshot\ndata: {\"generations\":[{"),
+            "{}",
+            body[0]
+        );
+        assert!(body[0].contains(&again));
+        assert_eq!(
+            body[1],
+            format!("event: generation\ndata: {{\"id\":\"{again}\"}}\n\n")
+        );
+        std::fs::remove_dir_all(&server.directory).unwrap();
     }
 
     #[test]
