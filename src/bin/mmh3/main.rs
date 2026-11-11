@@ -17,6 +17,9 @@ const USAGE: &str = "usage:
                 [--devices CARD,CARD...] [--worker HOST[:PORT] [--worker-units UNITS]]...
                 [--local-worker [--worker-units UNITS]] [--token FILE] [--consistent] [--vram-budget GB]
                 [--ffmpeg [FFMPEG_ARGUMENTS...]]
+  mmh3 image (--prompt TEXT | --prompt-file FILE) --out <image.png> [--models DIR] [--width N] [--height N]
+             [--min-generation-area N] [--seed N] [--dit FILE] [--text-encoder FILE] [--image-vae FILE]
+             [--attention-precision fp32|fp16|int8-fp16] [--linear-precision fp32|fp16|int8|mps-fp16]
 
 Metal linear precision: int8 (MPP, default on macOS 26), fp16 (MPP), mps-fp16 (default before macOS 26), or fp32.
 Metal attention precision: fp16 (MPP, default on macOS 26) or fp32.
@@ -27,6 +30,13 @@ Comfy-Org/MiniMax-H3 repository, given by --models or MMH3_MODELS:
   text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
   vae/minimax_h3_video_vae_fp16.safetensors
   vae/minimax_h3_audio_vae_fp32.safetensors
+image takes these from the Comfy-Org/MiniMax-H3-Image repository instead, and runs on Metal:
+  diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors
+  text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
+  vae/minimax_h3_image_vae_fp16.safetensors
+image generates a 4096×4096 picture by default in the checkpoint's 6 steps. A picture smaller than
+--min-generation-area pixels, 4194304 by default, is generated on a larger canvas of the same aspect ratio and
+resized back with Lanczos; 1024 generates every picture at its own size, rounded to a multiple of 32.
 --first-frame and --last-frame take PNG or JPEG pictures the video starts from and ends on. Without --width and
 --height the first picture sets the canvas's aspect ratio.
 --reference takes a PNG or JPEG picture the prompt refers to as <Picture 1>, <Picture 2> and so on, in the order
@@ -71,6 +81,7 @@ fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let result: Result<(), Box<dyn Error>> = match arguments.first().map(String::as_str) {
         Some("generate") => mmh3::generate::run(&arguments[1..], USAGE),
+        Some("image") => mmh3::image_generation::run(&arguments[1..], USAGE),
         #[cfg(any(feature = "cuda", feature = "metal"))]
         Some("worker") => mmh3::worker::serve(&arguments[1..]),
         #[cfg(feature = "server")]

@@ -1323,6 +1323,12 @@ fn dit_shape(
     let path = crate::models::option_path(options, "dit", dit_file)?;
     let file = SafeTensors::open(std::path::Path::new(&path))?;
     let config = DitConfig::of(&file, "").map_err(|error| format!("reading {path}: {error}"))?;
+    if !config.has_audio() || config.pdd_steps > 1 {
+        return Err(format!(
+            "{path} is a MiniMax-H3-Image DiT, which makes pictures with `mmh3 image`"
+        )
+        .into());
+    }
     let mut gated = DitConfig::gated(&file, "");
     for name in ["patch", "lora"] {
         if let Some(path) = crate::models::model_file(options, name, &["patches", "loras"])?

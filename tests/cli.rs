@@ -179,3 +179,100 @@ fn metal_rejects_unsupported_options_before_reading_models_or_pictures() {
         assert!(!error.contains("No such file"), "{error}");
     }
 }
+
+#[test]
+fn image_refuses_video_options_by_name() {
+    for option in ["--steps", "--lora", "--attention", "--frames"] {
+        let output = run(
+            MMH3,
+            &[
+                "image", "--prompt", "a cat", "--out", "cat.png", option, "4",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains(&format!("{option} is an option of `mmh3 generate`")),
+            "{error}"
+        );
+    }
+    let output = run(MMH3, &["image", "--unknown", "1"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mmh3 image"));
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn image_checks_its_output_and_size_before_reading_models() {
+    for (arguments, expected) in [
+        (&["--out", "cat.jpg"][..], "FILE.png"),
+        (&["--out", "missing/cat.png"][..], "No such file"),
+        (
+            &["--out", "cat.png", "--min-generation-area", "1023"][..],
+            "--min-generation-area",
+        ),
+        (&["--out", "cat.png", "--width", "0"][..], "--width"),
+    ] {
+        let output = run(
+            MMH3,
+            &[
+                &["image", "--prompt", "a cat", "--models", "missing"][..],
+                arguments,
+            ]
+            .concat(),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{arguments:?}: {error}");
+    }
+}
+
+/// A video checkpoint is refused by its header, before the text encoder is read.
+#[cfg(feature = "metal")]
+#[test]
+fn image_refuses_a_video_dit() {
+    let directory = tempfile::tempdir().unwrap();
+    let dit = directory.path().join("video_dit.safetensors");
+    let shapes: [(&str, &[usize]); 11] = [
+        ("video_patch_proj.weight", &[192, 96]),
+        ("audio_patch_proj.weight", &[192, 32]),
+        ("final_layer.video_out.weight", &[96, 192]),
+        ("blocks.0.attn.q_norm.weight", &[128]),
+        ("blocks.0.attn.qkv_proj.weight", &[768, 192]),
+        ("blocks.0.mlp.fc2.weight", &[192, 256]),
+        ("blocks.0.norm1.weight", &[192]),
+        ("token_refiner.blocks.0.norm1.weight", &[192]),
+        ("condition_proj.weight", &[192, 64]),
+        ("adaln_t_table", &[1025, 8]),
+        ("rope.inv_freq", &[16]),
+    ];
+    let zeros: Vec<Vec<f32>> = shapes
+        .iter()
+        .map(|(_, shape)| vec![0.0; shape.iter().product()])
+        .collect();
+    let tensors: Vec<(&str, &[usize], &[f32])> = shapes
+        .iter()
+        .zip(&zeros)
+        .map(|(&(name, shape), data)| (name, shape, data.as_slice()))
+        .collect();
+    mmh3_core::safetensors::write_f32(&dit, &tensors, &[]).unwrap();
+    let out = directory.path().join("cat.png");
+    let output = run(
+        MMH3,
+        &[
+            "image",
+            "--prompt",
+            "a cat",
+            "--out",
+            out.to_str().unwrap(),
+            "--dit",
+            dit.to_str().unwrap(),
+            "--text-encoder",
+            "missing.safetensors",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("not a MiniMax-H3-Image DiT"), "{error}");
+    assert!(!out.exists());
+}
