@@ -545,6 +545,48 @@ mod tests {
     }
 
     #[test]
+    fn places_an_image_after_the_text() {
+        let layout = PackedLayout::text_to_video(5, 1, 4, 6, 0);
+        let kinds: Vec<(SegmentKind, usize)> = layout
+            .segments
+            .iter()
+            .map(|segment| (segment.kind, segment.len()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (SegmentKind::Text, 5),
+                (SegmentKind::Audio, 0),
+                (SegmentKind::Video, 6),
+            ]
+        );
+        assert!(!layout.has_conditions());
+        // The image is one frame at the text's length, each axis spread over its share of the
+        // square root of the area.
+        let axis = |dimension: f64, count: usize| -> Vec<f64> {
+            let ratio = dimension / (4.0f64 * 6.0).sqrt();
+            (0..count)
+                .map(|k| ((1.0 - ratio) / 2.0 + k as f64 * ratio / count as f64) * 32.0)
+                .collect()
+        };
+        let (heights, widths) = (axis(4.0, 2), axis(6.0, 3));
+        let expected: Vec<[f64; 3]> = heights
+            .iter()
+            .flat_map(|&height| widths.iter().map(move |&width| [5.0, height, width]))
+            .collect();
+        for (actual, expected) in layout.positions[5..].iter().zip(&expected) {
+            for axis in 0..3 {
+                assert!((actual[axis] - expected[axis]).abs() < 1e-12, "{actual:?}");
+            }
+        }
+        // Text and image share the one timestep of the step, on their own AdaLN branches.
+        let timesteps = StepTimesteps::for_layout(&layout, 0.75, 1.0, 1.0);
+        assert_eq!(timesteps.values, [0.25]);
+        let rows = layout.modulation_rows(&timesteps);
+        assert_eq!(rows, [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
     fn places_segments_and_positions() {
         let layout = PackedLayout::text_to_video(3, 6, 4, 6, 2);
         assert_eq!(layout.len(), 3 + 4 + 6 * 2 * 3);

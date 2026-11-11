@@ -288,6 +288,24 @@ mod tests {
                 query_blocks: (1, 3)
             }
         );
+        // Without audio the text is the whole prefix, and only the query block the text shares
+        // with the image runs dense.
+        let image = PackedLayout::text_to_video(100, 1, 32, 32, 0);
+        assert_eq!(
+            SparseSinks::for_layout(&image),
+            SparseSinks {
+                key_blocks: (0, 2),
+                query_blocks: (1, 2)
+            }
+        );
+        let aligned = PackedLayout::text_to_video(128, 1, 32, 32, 0);
+        assert_eq!(
+            SparseSinks::for_layout(&aligned),
+            SparseSinks {
+                key_blocks: (0, 2),
+                query_blocks: (2, 2)
+            }
+        );
         let settings = SparseAttention::default();
         assert!(!settings.applies_to_step(0, 4) && settings.applies_to_step(1, 4));
         assert!(!settings.applies_to_step(3, 20) && settings.applies_to_step(4, 20));
