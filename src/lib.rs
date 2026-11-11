@@ -16,6 +16,8 @@ pub mod image;
 #[cfg(feature = "metal")]
 pub mod metal;
 pub mod models;
+#[cfg(feature = "server")]
+pub mod provenance;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod resident;
 #[cfg(feature = "server")]

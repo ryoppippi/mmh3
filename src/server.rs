@@ -29,6 +29,9 @@ use tokio::io::AsyncWriteExt;
 /// The directories of a job that hold a picture's previews and the references a request uploaded.
 const PREVIEWS: &str = "previews";
 const REFERENCES: &str = "references";
+/// The file of a job that says what it was asked, how it went and what made it, from which a server
+/// started again restores the generations of the one before.
+const METADATA: &str = "metadata.json";
 /// Where a server waits when it is not told.
 const DEFAULT_LISTEN: &str = "127.0.0.1:8833";
 /// The most a field that stands for an option may hold. An option is a number or a sentence, and
@@ -273,6 +276,110 @@ impl Job {
     }
 }
 
+/// A job of an earlier run of the server from what its directory's metadata says, or None for a
+/// directory that is not a job's. A job that was waiting or running when that server stopped never
+/// ended, and is restored failed.
+fn restore(directory: &std::path::Path) -> Option<Job> {
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join(METADATA)).ok()?).ok()?;
+    let output = match metadata["kind"].as_str()? {
+        "image" => Output::Picture,
+        "video" => Output::Video,
+        _ => return None,
+    };
+    let (state, failure) = match metadata["state"].as_str()? {
+        "done" => (Stage::Done, None),
+        "failed" => (Stage::Failed, metadata["error"].as_str().map(str::to_owned)),
+        "cancelled" => (Stage::Cancelled, None),
+        "queued" | "running" => (Stage::Failed, Some(INTERRUPTED.to_owned())),
+        _ => return None,
+    };
+    let written = match output {
+        Output::Picture => directory.join("image.png"),
+        // The container is the one of the server that wrote it, which need not be this one's.
+        Output::Video => std::fs::read_dir(directory)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.file_stem().is_some_and(|stem| stem == "video"))
+            .unwrap_or_else(|| directory.join("video")),
+    };
+    let time = |field: &str| {
+        metadata[field]
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .map(|seconds| UNIX_EPOCH + Duration::from_secs_f64(seconds))
+    };
+    Some(Job {
+        state,
+        arguments: Vec::new(),
+        directory: directory.to_owned(),
+        output,
+        written,
+        failure,
+        request: metadata["request"].clone(),
+        queued: time("created_at")?,
+        started: None,
+        started_at: time("started_at"),
+        finished_at: time("finished_at"),
+        seconds: metadata["seconds"].as_f64(),
+        timings: metadata["timings"].clone(),
+        preview_step: metadata["preview_step"].as_u64().map(|step| step as usize),
+        models: Vec::new(),
+    })
+}
+
+/// Every job under the jobs directory `directory` that a server before this one left, by id.
+fn restore_all(directory: &std::path::Path) -> HashMap<String, Job> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return HashMap::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let id = entry.file_name().into_string().ok()?;
+            let job = restore(&entry.path())?;
+            // What the metadata said of a job that never ended is put right, so that it says so
+            // the next time too.
+            if job.failure.as_deref() == Some(INTERRUPTED) {
+                write_metadata(&job.directory, job.describe(&id), &[]);
+            }
+            Some((id, job))
+        })
+        .collect()
+}
+
+/// Why a job restored waiting or running failed.
+const INTERRUPTED: &str = "the server stopped before this generation ended";
+
+/// Writes a job's `metadata.json` beside what it wrote: `described`, the generation as the server
+/// describes it, with the checkpoints it read, the build of mmh3 and the machine. It is written
+/// beside and renamed, so that a server starting never reads half of one. A job that cannot have
+/// its metadata written still runs, and says so.
+fn write_metadata(
+    directory: &std::path::Path,
+    mut described: serde_json::Value,
+    models: &[PathBuf],
+) {
+    described["models"] = models
+        .iter()
+        .map(|path| crate::provenance::model(path))
+        .collect();
+    described["mmh3"] = crate::provenance::build();
+    described["machine"] = crate::provenance::machine();
+    let partial = directory.join(format!(".{METADATA}"));
+    let written = serde_json::to_vec_pretty(&described)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&partial, bytes))
+        .and_then(|()| std::fs::rename(&partial, directory.join(METADATA)));
+    if let Err(error) = written {
+        eprintln!(
+            "warning: writing the metadata of {}: {error}",
+            directory.display()
+        );
+    }
+}
+
 fn unix_seconds(time: SystemTime) -> f64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -403,6 +510,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
     };
     std::fs::create_dir_all(&directory)?;
+    let restored = restore_all(&directory);
     let container = match options.get("format").copied().unwrap_or("mp4") {
         "mp4" => Container::Mp4,
         "webm" => Container::Webm,
@@ -480,7 +588,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let (queue, waiting) = channel();
     let server = Arc::new(Server {
-        jobs: Mutex::new(HashMap::new()),
+        jobs: Mutex::new(restored),
         queue,
         defaults,
         image_defaults,
@@ -541,21 +649,35 @@ fn generate(
     id: &str,
     run: impl FnOnce(&[String], Output, &mut Reporting) -> Result<(), Box<dyn Error>>,
 ) {
-    let (arguments, output) = {
+    let (arguments, output, directory, described) = {
         let mut jobs = server.jobs.lock().expect("the jobs");
-        // A job cancelled while it waited is dropped here, as one taken away is.
-        let Some(job) = jobs.get_mut(id).filter(|job| job.state == Stage::Queued) else {
+        let Some(job) = jobs.get_mut(id) else {
             return;
         };
+        // A job cancelled while it waited is dropped here, with its metadata written as for any
+        // other end.
+        if job.state != Stage::Queued {
+            let (directory, described) = (job.directory.clone(), job.describe(id));
+            drop(jobs);
+            write_metadata(&directory, described, &[]);
+            return;
+        }
         job.state = Stage::Running;
         job.started = Some(Instant::now());
         job.started_at = Some(SystemTime::now());
         // Under the lock, so that a cancel of this job, which takes the lock to see it running,
         // comes after the flag of the run before it is cleared.
         crate::generation::starting();
-        (job.arguments.clone(), job.output)
+        (
+            job.arguments.clone(),
+            job.output,
+            job.directory.clone(),
+            job.describe(id),
+        )
     };
     println!("generation {id} begins");
+    // Written as it starts too, so that a server stopped during it restores it as failed.
+    write_metadata(&directory, described, &[]);
     let mut watch = |report: &crate::image::Report| {
         if let Some(job) = server.jobs.lock().expect("the jobs").get_mut(id) {
             job.take_report(report);
@@ -583,6 +705,9 @@ fn generate(
             job.failure = Some(error.to_string());
         }
     }
+    let (described, models) = (job.describe(id), job.models.clone());
+    drop(jobs);
+    write_metadata(&directory, described, &models);
 }
 
 /// Takes a generation, and answers with the job rather than with the video, which is not there
@@ -783,13 +908,15 @@ async fn cancel(
 /// Every generation this server has been asked for, the most recent first.
 async fn list(State(server): State<Arc<Server>>) -> Response {
     let jobs = server.jobs.lock().expect("the jobs");
-    let mut described: Vec<(SystemTime, serde_json::Value)> = jobs
+    // Ids count up within a run of the server, which orders two asked for in the same instant.
+    let mut described: Vec<(SystemTime, &String, serde_json::Value)> = jobs
         .iter()
-        .map(|(id, job)| (job.queued, job.describe(id)))
+        .map(|(id, job)| (job.queued, id, job.describe(id)))
         .collect();
-    described.sort_by(|(one, _), (other, _)| other.cmp(one));
+    described
+        .sort_by(|(one, one_id, _), (other, other_id, _)| (other, other_id).cmp(&(one, one_id)));
     let generations: Vec<serde_json::Value> =
-        described.into_iter().map(|(_, value)| value).collect();
+        described.into_iter().map(|(_, _, value)| value).collect();
     Json(json!({ "generations": generations })).into_response()
 }
 
@@ -1444,6 +1571,93 @@ mod tests {
         assert_eq!(asked["lora"], "pdmd.safetensors");
         assert_eq!(asked["lora_strength"], 1.0);
         assert_eq!(asked["lora_mode"], "adapter");
+    }
+
+    #[test]
+    fn a_server_started_again_restores_the_generations_before() {
+        let _runs = RUNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (server, waiting) = test_server("restore");
+        let done = queue_picture_with(&server, &["--prompt", "a dog"]);
+        let cancelled = queue_picture(&server);
+        let interrupted = queue_picture(&server);
+        std::fs::create_dir_all(server.directory.join("not-a-job")).unwrap();
+
+        assert_eq!(waiting.recv().unwrap(), done);
+        generate(&server, &done, |_, _, watch| {
+            watch(&crate::image::Report {
+                timings: crate::image::Timings {
+                    steps: vec![1.0, 2.0],
+                    ..Default::default()
+                },
+                preview_step: Some(2),
+                ..Default::default()
+            });
+            Ok(())
+        });
+        block(cancel(State(Arc::clone(&server)), Path(cancelled.clone())))
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(waiting.recv().unwrap(), cancelled);
+        generate(&server, &cancelled, |_, _, _| unreachable!());
+        // A server that starts while this one runs a job finds it running, as one that starts
+        // after this one stopped half way through would.
+        let mut during = None;
+        assert_eq!(waiting.recv().unwrap(), interrupted);
+        generate(&server, &interrupted, |_, _, _| {
+            during = Some(restore_all(&server.directory));
+            Ok(())
+        });
+        let during = during.unwrap();
+        assert_eq!(during[&interrupted].state.name(), "failed");
+        assert_eq!(during[&interrupted].failure.as_deref(), Some(INTERRUPTED));
+
+        let restored = restore_all(&server.directory);
+        let mut ids: Vec<&String> = restored.keys().collect();
+        ids.sort();
+        assert_eq!(ids, [&done, &cancelled, &interrupted]);
+        let jobs = server.jobs.lock().unwrap();
+        for id in [&done, &cancelled, &interrupted] {
+            let (mut live, mut again) = (jobs[id].describe(id), restored[id].describe(id));
+            for field in ["created_at", "started_at", "finished_at"] {
+                let (one, other) = (live[field].as_f64(), again[field].as_f64());
+                assert_eq!(one.is_some(), other.is_some(), "{id} {field}");
+                assert!((one.unwrap_or(0.0) - other.unwrap_or(0.0)).abs() < 1e-3);
+                live[field] = serde_json::Value::Null;
+                again[field] = serde_json::Value::Null;
+            }
+            assert_eq!(live, again, "{id}");
+        }
+        drop(jobs);
+        assert_eq!(
+            restored[&done].describe(&done)["timings"]["steps"],
+            json!([1.0, 2.0])
+        );
+        assert_eq!(restored[&done].preview_step, Some(2));
+        assert_eq!(restored[&cancelled].state.name(), "cancelled");
+
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(server.directory.join(&done).join(METADATA)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["mmh3"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(metadata["models"].is_array());
+        assert!(metadata["machine"].is_object());
+
+        // The list of a server started again is the most recent first.
+        let (again, _) = test_server("restore-list");
+        *again.jobs.lock().unwrap() = restored;
+        let response = block(list(State(Arc::clone(&again))));
+        let (_, listed) = answer(Ok(response));
+        let listed: Vec<&str> = listed["generations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|generation| generation["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, [&interrupted, &cancelled, &done]);
+        std::fs::remove_dir_all(&server.directory).unwrap();
+        std::fs::remove_dir_all(&again.directory).unwrap();
     }
 
     #[test]
