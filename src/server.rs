@@ -440,7 +440,8 @@ fn request(arguments: &[String], output: Output) -> serde_json::Value {
             picture.then_some(crate::image::DEFAULT_MIN_GENERATION_AREA),
         ),
         "attention_precision": given("attention-precision"),
-        "attention": given("attention").unwrap_or("dense"),
+        // A video's default depends on its DiT, which picks VSA when it has VSA's gates.
+        "attention": given("attention").or(picture.then_some("dense")),
         "sparse_tau": float("sparse-tau"),
         "sparse_start": float("sparse-start"),
         "draft_steps": number("draft-steps", picture.then_some(0)),
