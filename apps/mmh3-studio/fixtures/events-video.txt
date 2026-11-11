@@ -1,4 +1,0 @@
-data: {"error":null,"id":"6ab1cf3b0000","queued":1790037819,"seconds":null,"state":"running","step":3,"steps":4}
-
-data: {"error":null,"id":"6ab1cf3b0000","queued":1790037819,"seconds":10.9,"state":"done","step":null,"steps":null}
-
