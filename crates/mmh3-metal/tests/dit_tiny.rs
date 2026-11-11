@@ -142,19 +142,28 @@ fn frames(latent: &Tensor, first: usize, count: usize) -> Tensor {
 
 /// The CPU reference's outputs for `inputs` with the fixture's weights.
 fn cpu_forward(file: &SafeTensors, inputs: &DitInputs) -> mmh3_cpu::dit::DitTrace {
+    cpu_forward_with(file, "weight.", inputs)
+}
+
+/// The CPU reference's outputs for `inputs` with the weights of `file` under `prefix`.
+fn cpu_forward_with(
+    file: &SafeTensors,
+    prefix: &str,
+    inputs: &DitInputs,
+) -> mmh3_cpu::dit::DitTrace {
     use mmh3_core::dit::config::DitConfig;
     use std::collections::HashMap;
 
     let mut tensors = HashMap::new();
     for info in file.tensors() {
-        if let Some(name) = info.name.strip_prefix("weight.") {
+        if let Some(name) = info.name.strip_prefix(prefix)
+            && !mmh3_core::safetensors::is_comfy_metadata(name)
+        {
             tensors.insert(name.to_owned(), Tensor::load(file, info).unwrap());
         }
     }
 
-    let config =
-        DitConfig::from_shapes(|name| tensors.get(name).map(|tensor| tensor.shape.clone()))
-            .unwrap();
+    let config = DitConfig::of(file, prefix).unwrap();
     mmh3_cpu::dit::forward(&mmh3_cpu::dit::DitWeights::new(tensors), &config, inputs)
 }
 
@@ -385,4 +394,285 @@ fn adapter_lora_matches_a_cpu_weight_update() {
     assert_close("LoRA audio", &actual.audio, &expected.audio);
     assert!(video_change(&original.video, &actual.video) > 1e-4);
     assert!(dit.add_lora(&lora, strength).is_err());
+}
+
+/// The grid MiniMax-H3-Image's bank was distilled on.
+const IMAGE_SIGMAS: [f64; 7] = [
+    1.0,
+    0.9675236940383911,
+    0.8875485062599182,
+    0.75,
+    0.5327739119529724,
+    0.23200887441635132,
+    0.0,
+];
+
+/// A tensor as a checkpoint stores it.
+struct Stored {
+    name: String,
+    dtype: mmh3_core::safetensors::DType,
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+impl Stored {
+    fn f32(name: &str, shape: Vec<usize>, values: &[f32]) -> Self {
+        Stored {
+            name: name.to_owned(),
+            dtype: mmh3_core::safetensors::DType::F32,
+            shape,
+            bytes: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        }
+    }
+}
+
+fn write_checkpoint(path: &Path, tensors: &[Stored], metadata: &[(&str, &str)]) {
+    use mmh3_core::json::quote;
+    use std::io::Write;
+
+    let mut entries: Vec<String> = vec![format!(
+        "\"__metadata__\":{{{}}}",
+        metadata
+            .iter()
+            .map(|(key, value)| format!("{}:{}", quote(key), quote(value)))
+            .collect::<Vec<_>>()
+            .join(",")
+    )];
+    let mut offset = 0;
+    for tensor in tensors {
+        let end = offset + tensor.bytes.len();
+        entries.push(format!(
+            "{}:{{\"dtype\":\"{}\",\"shape\":{:?},\"data_offsets\":[{offset},{end}]}}",
+            quote(&tensor.name),
+            tensor.dtype.name(),
+            tensor.shape
+        ));
+        offset = end;
+    }
+    let mut header = format!("{{{}}}", entries.join(","));
+    while !header.len().is_multiple_of(8) {
+        header.push(' ');
+    }
+    let mut file = std::fs::File::create(path).unwrap();
+    file.write_all(&(header.len() as u64).to_le_bytes())
+        .unwrap();
+    file.write_all(header.as_bytes()).unwrap();
+    for tensor in tensors {
+        file.write_all(&tensor.bytes).unwrap();
+    }
+}
+
+/// The tiny fixture's weights as MiniMax-H3-Image's checkpoint holds its own: without the audio
+/// stream, with BF16 AdaLN biases, with ComfyUI's attention hint beside a block, and with a bank of `heads` video heads, the first the
+/// fixture's and the others stored as offsets from it. `metadata` puts the bank's grid in the
+/// file. With `merged`, the bank is instead the one head of that step, first head and offset
+/// summed, which is what a step of the bank has to project with.
+fn image_checkpoint(heads: usize, metadata: bool, merged: Option<usize>) -> Checkpoint {
+    use mmh3_core::numeric::f32_to_bf16;
+    use mmh3_core::safetensors::DType;
+
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    let mut tensors = Vec::new();
+    for info in file.tensors() {
+        let Some(name) = info.name.strip_prefix("weight.") else {
+            continue;
+        };
+        if name.starts_with("audio_patch_proj.") || name.starts_with("final_layer.audio_out.") {
+            continue;
+        }
+        let tensor = Tensor::load(&file, info).unwrap();
+        if name.starts_with("final_layer.video_out.") {
+            let rows = tensor.shape[0];
+            let width = tensor.data.len() / rows;
+            let offset = |head: usize, index: usize| {
+                ((index * 7 + head * 13) as f32 * 0.61).sin() * 0.05 * head as f32
+            };
+            let head = &tensor.data;
+            let bank: Vec<f32> = match merged {
+                Some(step) => (0..rows * width)
+                    .map(|index| head[index] + offset(step, index))
+                    .collect(),
+                None => (0..heads)
+                    .flat_map(|step| {
+                        (0..rows * width).map(move |index| match step {
+                            0 => head[index],
+                            _ => offset(step, index),
+                        })
+                    })
+                    .collect(),
+            };
+            let mut shape = tensor.shape.clone();
+            shape[0] = bank.len() / width;
+            tensors.push(Stored::f32(name, shape, &bank));
+        } else if name.ends_with("adaln_proj.linear.bias") {
+            tensors.push(Stored {
+                name: name.to_owned(),
+                dtype: DType::BF16,
+                shape: tensor.shape.clone(),
+                bytes: tensor
+                    .data
+                    .iter()
+                    .flat_map(|&value| f32_to_bf16(value).to_le_bytes())
+                    .collect(),
+            });
+        } else {
+            tensors.push(Stored {
+                name: name.to_owned(),
+                dtype: info.dtype,
+                shape: info.shape.clone(),
+                bytes: file.data(info).to_vec(),
+            });
+        }
+    }
+    let hint = br#"{"sage_attention": false}"#;
+    tensors.push(Stored {
+        name: "blocks.0.attn.comfy_attention.config".to_owned(),
+        dtype: DType::U8,
+        shape: vec![hint.len()],
+        bytes: hint.to_vec(),
+    });
+    let config = format!(
+        "{{\"transformer\": {{\"pdd_steps\": {heads}, \"pdd_sigmas\": {:?}}}}}",
+        &IMAGE_SIGMAS[..]
+    );
+    let named = [("config", config.as_str())];
+    let metadata = if metadata { &named[..] } else { &[] };
+    static WRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "mmh3-metal-dit-image-{}-{}.safetensors",
+        std::process::id(),
+        WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    write_checkpoint(&path, &tensors, metadata);
+    Checkpoint {
+        file: SafeTensors::open(&path).unwrap(),
+        path,
+    }
+}
+
+/// A checkpoint written for a test, which the DiT reads from its path while it loads.
+struct Checkpoint {
+    file: SafeTensors,
+    path: std::path::PathBuf,
+}
+
+impl Drop for Checkpoint {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// One step of text-to-image on the fixture's first latent frame.
+fn image_inputs(step: usize, sigma: f32) -> DitInputs {
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    DitInputs {
+        video: frames(&unbatched(tensor(&file, "input.video")), 0, 1),
+        audio: DitInputs::no_audio(),
+        context: unbatched(tensor(&file, "input.context")),
+        context_modalities: Vec::new(),
+        keyframes: Vec::new(),
+        references: Vec::new(),
+        sigma,
+        shift_video: 1.0,
+        shift_audio: 1.0,
+        pdd_step: step,
+    }
+}
+
+#[test]
+fn reads_an_image_checkpoint() {
+    use mmh3_core::dit::sampler::Schedule;
+
+    let checkpoint = image_checkpoint(6, true, None);
+    let file = &checkpoint.file;
+    let dit = MetalDit::load(file, "").unwrap();
+    let config = dit.config();
+    assert_eq!((config.audio_channels, config.pdd_steps), (0, 6));
+    let schedule = Schedule::pdd(config.pdd_sigmas.as_deref().unwrap());
+    assert_eq!(schedule.steps(), 6);
+
+    let unnamed = image_checkpoint(6, false, None);
+    let dit = MetalDit::load(&unnamed.file, "").unwrap();
+    assert_eq!(
+        (dit.config().pdd_steps, &dit.config().pdd_sigmas),
+        (6, &None)
+    );
+}
+
+#[test]
+fn follows_the_cpu_reference_on_an_image() {
+    use mmh3_core::dit::sampler::Schedule;
+
+    let checkpoint = image_checkpoint(6, true, None);
+    let file = &checkpoint.file;
+    let dit = MetalDit::load(file, "").unwrap();
+    let schedule = Schedule::pdd(dit.config().pdd_sigmas.as_deref().unwrap());
+    let mut outputs = Vec::new();
+    for step in [0, 1, 4] {
+        let inputs = image_inputs(step, schedule.video[step]);
+        let expected = cpu_forward_with(file, "", &inputs);
+        let actual = dit.forward(&inputs, &[], None).unwrap();
+        assert_close(
+            &format!("image step {step}"),
+            &actual.video,
+            &expected.video,
+        );
+        assert!(actual.audio.is_empty() && expected.audio.is_empty());
+        outputs.push(actual.video);
+    }
+    assert!(video_change(&outputs[0], &outputs[1]) > 1e-3);
+
+    // The heads alone tell two steps apart.
+    let sigma = schedule.video[2];
+    let first = dit.forward(&image_inputs(0, sigma), &[], None).unwrap();
+    let third = dit.forward(&image_inputs(2, sigma), &[], None).unwrap();
+    let change = video_change(&first.video, &third.video);
+    assert!(change > 1e-3, "the heads change the video by only {change}");
+
+    let context = image_inputs(0, sigma).context;
+    let prepared = dit.prepare_text(&context).unwrap();
+    let cached = prepared
+        .forward(&image_inputs(2, sigma), &[], None)
+        .unwrap();
+    assert_eq!(cached.video, third.video);
+}
+
+#[test]
+fn projects_each_step_with_its_merged_head() {
+    let bank = MetalDit::load(&image_checkpoint(6, true, None).file, "").unwrap();
+    for step in [0, 3, 5] {
+        let single = MetalDit::load(&image_checkpoint(1, false, Some(step)).file, "").unwrap();
+        assert_eq!(single.config().pdd_steps, 1);
+        let sigma = IMAGE_SIGMAS[step] as f32;
+        let expected = single.forward(&image_inputs(0, sigma), &[], None).unwrap();
+        let actual = bank.forward(&image_inputs(step, sigma), &[], None).unwrap();
+        assert_close(&format!("head {step}"), &actual.video, &expected.video);
+    }
+}
+
+#[test]
+fn refuses_inputs_that_do_not_match_the_streams() {
+    let image = MetalDit::load(&image_checkpoint(6, true, None).file, "").unwrap();
+    assert!(image.forward(&image_inputs(6, 0.5), &[], None).is_err());
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    let mut with_audio = image_inputs(0, 0.5);
+    with_audio.audio = unbatched(tensor(&file, "input.audio"));
+    assert!(image.forward(&with_audio, &[], None).is_err());
+
+    let video = MetalDit::load(&file, "weight.").unwrap();
+    assert_eq!(
+        (video.config().audio_channels, video.config().pdd_steps),
+        (32, 1)
+    );
+    let mut silent = image_inputs(0, 0.5);
+    silent.audio = Tensor::new(vec![32, 2, 0], Vec::new());
+    assert!(video.forward(&silent, &[], None).is_err());
+    let mut later = image_inputs(1, 0.5);
+    later.audio = unbatched(tensor(&file, "input.audio"));
+    assert!(video.forward(&later, &[], None).is_err());
+    later.pdd_step = 0;
+    assert!(video.forward(&later, &[], None).is_ok());
 }

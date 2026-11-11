@@ -41,6 +41,9 @@ pub struct MetalDit {
     config: DitConfig,
     time_table: Tensor,
     inv_freq: Vec<f32>,
+    /// The weight and bias of every video head of a PDD checkpoint's bank, summed with the first
+    /// head from the offsets the checkpoint stores, or none for a plain head.
+    video_heads: Vec<(Array, Array)>,
     /// The blocks read on the way, when some are.
     stream: Option<RefCell<Stream>>,
     /// Veda's predictor, which `--attention veda` needs.
@@ -164,14 +167,71 @@ impl MetalDit {
     fn from_weights(weights: Weights, config: DitConfig, stream: Option<Stream>) -> Result<Self> {
         let time_table = weights.host("adaln_t_table")?;
         let inv_freq = weights.host("rope.inv_freq")?.data;
+        let video_heads = Self::video_heads(&weights, &config)?;
         Ok(Self {
             weights,
             config,
             time_table,
             inv_freq,
+            video_heads,
             stream: stream.map(RefCell::new),
             veda: None,
         })
+    }
+
+    /// The bank of a PDD checkpoint stores its first head whole and every later one as an offset
+    /// from it. Summing them once here leaves a step one product of the plain head's size.
+    fn video_heads(weights: &Weights, config: &DitConfig) -> Result<Vec<(Array, Array)>> {
+        if config.pdd_steps == 1 {
+            return Ok(Vec::new());
+        }
+        if config.has_audio() {
+            return Err(Error::new(
+                "PDD heads beside the audio stream are not supported".into(),
+            ));
+        }
+        let (weight, bias) = (
+            weights.host("final_layer.video_out.weight")?,
+            weights.host("final_layer.video_out.bias")?,
+        );
+        let (outputs, inputs) = (config.video_patch_features(), config.hidden);
+        let head = |values: &[f32], step: usize, width: usize| -> Vec<f32> {
+            let first = &values[..width];
+            if step == 0 {
+                return first.to_vec();
+            }
+            first
+                .iter()
+                .zip(&values[step * width..(step + 1) * width])
+                .map(|(&first, &offset)| first + offset)
+                .collect()
+        };
+        (0..config.pdd_steps)
+            .map(|step| {
+                Ok((
+                    Array::from_f32(
+                        &weights.device,
+                        outputs,
+                        inputs,
+                        &head(&weight.data, step, outputs * inputs),
+                    )?,
+                    Array::from_f32(
+                        &weights.device,
+                        1,
+                        outputs,
+                        &head(&bias.data, step, outputs),
+                    )?,
+                ))
+            })
+            .collect()
+    }
+
+    /// The video projection of the final layer, with the head of `pdd_step` for a PDD checkpoint.
+    fn project_video(&self, x: &Array, pdd_step: usize) -> Result<Array> {
+        match self.video_heads.get(pdd_step) {
+            Some((weight, bias)) => x.linear(weight)?.add(bias),
+            None => self.weights.linear(x, "final_layer.video_out"),
+        }
     }
 
     /// Takes Veda's predictor, which picks the tiles of `--attention veda`.
@@ -257,6 +317,15 @@ impl MetalDit {
     /// tensors replaced or added.
     pub fn add_lora(&mut self, file: &SafeTensors, strength: f32) -> Result<usize> {
         const PREFIX: &str = "diffusion_model.";
+        if self.config.pdd_steps > 1
+            && file
+                .get(&format!("{PREFIX}final_layer.video_out.lora_A.weight"))
+                .is_some()
+        {
+            return Err(Error::new(
+                "a LoRA cannot adapt the video heads of a PDD checkpoint".into(),
+            ));
+        }
         let mut replaced = 0;
         for info in file.tensors() {
             let Some(name) = info.name.strip_prefix(PREFIX) else {
@@ -281,6 +350,7 @@ impl MetalDit {
         }
         if replaced > 0 {
             self.time_table = self.weights.host("adaln_t_table")?;
+            self.video_heads = Self::video_heads(&self.weights, &self.config)?;
         }
         let added = self.weights.add_lora(file, strength)? + replaced;
         if added == 0 {
@@ -744,7 +814,8 @@ impl MetalDit {
             || inputs.audio.shape.len() != 3
             || inputs.audio.shape[0] != c.audio_channels
             || inputs.audio.shape[1] != 2
-            || inputs.audio.shape[2] == 0
+            || (inputs.audio.shape[2] == 0) == c.has_audio()
+            || inputs.pdd_step >= c.pdd_steps
             || !inputs.sigma.is_finite()
             || !(0.0..=1.0).contains(&inputs.sigma)
         {
@@ -866,6 +937,9 @@ impl MetalDit {
         let mut parts = Vec::new();
 
         for segment in &layout.segments {
+            if segment.is_empty() {
+                continue;
+            }
             let (latent, video) = match segment.kind {
                 SegmentKind::Text => {
                     parts.push(text.clone());
@@ -1041,7 +1115,7 @@ impl MetalDit {
         }
 
         let m = modulation("final_layer.adaln_proj.linear", 2)?;
-        let project = |kind, name: &str| -> Result<Vec<f32>> {
+        let project = |kind, head: &dyn Fn(&Array) -> Result<Array>| -> Result<Vec<f32>> {
             let s = layout.segment(kind);
             let (first, last) = (s.start.max(carried.start), s.end.min(carried.end));
             if first >= last {
@@ -1055,14 +1129,18 @@ impl MetalDit {
             )?;
             let m = m.slice(timesteps.index_of(kind), 1, 0, 2 * width)?;
             let rows = RowMap::new(d, &vec![0; x.shape()[0]])?;
-            w.linear(&x.modulate(&m, &rows, 0, 1)?, name)?.to_f32()
+            head(&x.modulate(&m, &rows, 0, 1)?)?.to_f32()
         };
 
-        let mut video = project(SegmentKind::Video, "final_layer.video_out")?;
+        let mut video = project(SegmentKind::Video, &|x| {
+            self.project_video(x, inputs.pdd_step)
+        })?;
         if let Some(plan) = &plan {
             video = plan.restore_video(&video, c.video_patch_features());
         }
-        let audio = project(SegmentKind::Audio, "final_layer.audio_out")?;
+        let audio = project(SegmentKind::Audio, &|x| {
+            w.linear(x, "final_layer.audio_out")
+        })?;
         // The rows of one rank cannot be unpatchified on their own, so a share answers with the
         // parts as the projections left them and a leader puts them together.
         //
