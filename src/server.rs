@@ -26,6 +26,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
+/// The directories of a job that hold a picture's previews and the references a request uploaded.
+const PREVIEWS: &str = "previews";
+const REFERENCES: &str = "references";
 /// Where a server waits when it is not told.
 const DEFAULT_LISTEN: &str = "127.0.0.1:8833";
 /// The most a field that stands for an option may hold. An option is a number or a sentence, and
@@ -144,6 +147,15 @@ enum Output {
     Picture,
 }
 
+impl Output {
+    fn name(self) -> &'static str {
+        match self {
+            Output::Video => "video",
+            Output::Picture => "image",
+        }
+    }
+}
+
 /// What a generation the server was asked for is doing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -182,12 +194,42 @@ struct Job {
     written: PathBuf,
     /// Why it failed, for a client that asks after it did.
     failure: Option<String>,
+    /// What the request asked for, in the terms a client shows it in.
+    request: serde_json::Value,
     queued: SystemTime,
     started: Option<Instant>,
+    started_at: Option<SystemTime>,
+    finished_at: Option<SystemTime>,
     seconds: Option<f64>,
+    /// The seconds of each stage, as a picture's run reports them.
+    timings: serde_json::Value,
+    /// The last step with a preview in the job's `previews` directory.
+    preview_step: Option<usize>,
+    /// The checkpoints the run read.
+    models: Vec<PathBuf>,
 }
 
 impl Job {
+    fn new(output: Output, arguments: Vec<String>, directory: PathBuf, written: PathBuf) -> Self {
+        Job {
+            state: Stage::Queued,
+            request: request(&arguments, output),
+            arguments,
+            directory,
+            output,
+            written,
+            failure: None,
+            queued: SystemTime::now(),
+            started: None,
+            started_at: None,
+            finished_at: None,
+            seconds: None,
+            timings: serde_json::Value::Null,
+            preview_step: None,
+            models: Vec::new(),
+        }
+    }
+
     fn describe(&self, id: &str) -> serde_json::Value {
         // Only the generation that is running is the one the steps belong to.
         let progress = (self.state == Stage::Running)
@@ -195,14 +237,120 @@ impl Job {
             .flatten();
         json!({
             "id": id,
+            "kind": self.output.name(),
             "state": self.state.name(),
             "queued": self.queued.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             "seconds": self.seconds,
             "step": progress.map(|progress| progress.step),
             "steps": progress.map(|progress| progress.steps),
             "error": self.failure,
+            "request": self.request,
+            "created_at": unix_seconds(self.queued),
+            "started_at": self.started_at.map(unix_seconds),
+            "finished_at": self.finished_at.map(unix_seconds),
+            "timings": self.timings,
+            "preview_step": self.preview_step,
         })
     }
+
+    /// Takes in what a picture's run reports of itself.
+    fn take_report(&mut self, report: &crate::image::Report) {
+        let timings = &report.timings;
+        self.timings = json!({
+            "load_text": timings.load_text,
+            "encode": timings.encode,
+            "load_dit": timings.load_dit,
+            "steps": timings.steps,
+            "decode_read": timings.decode_read,
+            "decode": timings.decode,
+            "write": timings.write,
+        });
+        self.preview_step = report.preview_step;
+        self.models = report.models.clone();
+        if let Some(precision) = report.attention_precision {
+            self.request["attention_precision"] = precision.into();
+        }
+    }
+}
+
+fn unix_seconds(time: SystemTime) -> f64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// What a generation told `arguments` was asked for, as `{prompt, width, height, seed,
+/// min_generation_area, attention_precision, attention, sparse_tau, sparse_start, draft_steps,
+/// latent_upscaler, renoise_sigma, steps, shift, patch, lora, lora_strength, lora_mode,
+/// references}`, with a picture's defaults where the request left an option out. A prompt from a
+/// file is the file's text, a reference is the name of its file in the job's `references`
+/// directory, and a latent upscaler, a patch or a LoRA is the name of its checkpoint.
+fn request(arguments: &[String], output: Output) -> serde_json::Value {
+    let given = |name: &str| {
+        let option = format!("--{name}");
+        arguments
+            .windows(2)
+            .rev()
+            .find(|pair| pair[0] == option)
+            .map(|pair| pair[1].as_str())
+    };
+    let number = |name: &str, default: Option<usize>| -> serde_json::Value {
+        match given(name) {
+            Some(value) => value
+                .parse::<u64>()
+                .map_or_else(|_| value.into(), serde_json::Value::from),
+            None => default.into(),
+        }
+    };
+    let float = |name: &str| -> serde_json::Value {
+        given(name).map_or(serde_json::Value::Null, |value| {
+            value
+                .parse::<f64>()
+                .map_or_else(|_| value.into(), serde_json::Value::from)
+        })
+    };
+    let file_name = |path: &str| {
+        std::path::Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    };
+    let picture = output == Output::Picture;
+    let prompt = given("prompt")
+        .map(str::to_owned)
+        .or_else(|| given("prompt-file").and_then(|path| std::fs::read_to_string(path).ok()));
+    let references: Vec<String> = crate::cli::option_values(arguments, "reference")
+        .into_iter()
+        .filter_map(file_name)
+        .collect();
+    let lora = given("lora").and_then(file_name);
+    json!({
+        "prompt": prompt,
+        "width": number("width", picture.then_some(crate::image::DEFAULT_SIDE)),
+        "height": number("height", picture.then_some(crate::image::DEFAULT_SIDE)),
+        "seed": number("seed", Some(0)),
+        "min_generation_area": number(
+            "min-generation-area",
+            picture.then_some(crate::image::DEFAULT_MIN_GENERATION_AREA),
+        ),
+        "attention_precision": given("attention-precision"),
+        "attention": given("attention").unwrap_or("dense"),
+        "sparse_tau": float("sparse-tau"),
+        "sparse_start": float("sparse-start"),
+        "draft_steps": number("draft-steps", picture.then_some(0)),
+        "latent_upscaler": given("latent-upscaler").and_then(file_name),
+        "renoise_sigma": float("renoise-sigma"),
+        "steps": number("steps", None),
+        "shift": float("shift"),
+        "patch": given("patch").and_then(file_name),
+        "lora": lora,
+        "lora_strength": match (&lora, given("lora-strength")) {
+            (None, _) => serde_json::Value::Null,
+            (Some(_), None) => 1.0.into(),
+            (Some(_), Some(_)) => float("lora-strength"),
+        },
+        "lora_mode": lora.as_ref().map(|_| given("lora-mode").unwrap_or("adapter")),
+        "references": references,
+    })
 }
 
 /// Everything the handlers share.
@@ -349,9 +497,9 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .name("generate".to_owned())
         .spawn(move || {
             for id in waiting {
-                generate(&generating, &id, |arguments, output| match output {
+                generate(&generating, &id, |arguments, output, watch| match output {
                     Output::Video => crate::generate::run(arguments, USAGE),
-                    Output::Picture => crate::image::run(arguments),
+                    Output::Picture => crate::image::run_watched(arguments, watch),
                 });
             }
         })?;
@@ -365,6 +513,8 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .route("/v1/generations/{id}/events", get(events))
         .route("/v1/generations/{id}/video", get(video))
         .route("/v1/generations/{id}/image", get(image))
+        .route("/v1/generations/{id}/preview", get(latest_preview))
+        .route("/v1/generations/{id}/preview/{step}", get(preview))
         // Each field holds itself to FIELD_BYTES or FILE_BYTES as it is read, which axum's limit on
         // the whole body, 2 MB, would cut short of any picture worth editing.
         .layer(axum::extract::DefaultBodyLimit::disable())
@@ -381,12 +531,15 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Where a picture's run reports what it has done so far.
+type Reporting<'a> = dyn FnMut(&crate::image::Report) + 'a;
+
 /// Runs one job to its end, whichever end that is, with `run`, which is handed what the generation
-/// was told and what it writes.
+/// was told, what it writes and where a picture reports itself.
 fn generate(
     server: &Server,
     id: &str,
-    run: impl FnOnce(&[String], Output) -> Result<(), Box<dyn Error>>,
+    run: impl FnOnce(&[String], Output, &mut Reporting) -> Result<(), Box<dyn Error>>,
 ) {
     let (arguments, output) = {
         let mut jobs = server.jobs.lock().expect("the jobs");
@@ -396,18 +549,25 @@ fn generate(
         };
         job.state = Stage::Running;
         job.started = Some(Instant::now());
+        job.started_at = Some(SystemTime::now());
         // Under the lock, so that a cancel of this job, which takes the lock to see it running,
         // comes after the flag of the run before it is cleared.
         crate::generation::starting();
         (job.arguments.clone(), job.output)
     };
     println!("generation {id} begins");
-    let generated = run(&arguments, output);
+    let mut watch = |report: &crate::image::Report| {
+        if let Some(job) = server.jobs.lock().expect("the jobs").get_mut(id) {
+            job.take_report(report);
+        }
+    };
+    let generated = run(&arguments, output, &mut watch);
     let mut jobs = server.jobs.lock().expect("the jobs");
     let Some(job) = jobs.get_mut(id) else {
         return;
     };
     job.seconds = job.started.map(|started| started.elapsed().as_secs_f64());
+    job.finished_at = Some(SystemTime::now());
     match generated {
         Ok(()) => {
             job.state = Stage::Done;
@@ -472,6 +632,8 @@ async fn create_image(
     let mut arguments = server.image_defaults.clone();
     arguments.push("--out".to_owned());
     arguments.push(picture.to_string_lossy().into_owned());
+    arguments.push("--preview-dir".to_owned());
+    arguments.push(directory.join(PREVIEWS).to_string_lossy().into_owned());
     if let Err(failure) = read_fields(
         &server,
         &mut form,
@@ -496,17 +658,7 @@ fn queue_job(
     directory: PathBuf,
     written: PathBuf,
 ) -> Result<Response, Failure> {
-    let job = Job {
-        state: Stage::Queued,
-        arguments,
-        directory,
-        output,
-        written,
-        failure: None,
-        queued: SystemTime::now(),
-        started: None,
-        seconds: None,
-    };
+    let job = Job::new(output, arguments, directory, written);
     let described = job.describe(&id);
     server
         .jobs
@@ -541,7 +693,7 @@ async fn read_fields(
         let value = match (kind, field.file_name().map(str::to_owned)) {
             // A file stands for the path it is written to, which is this job's own directory.
             (FieldKind::File, Some(filename)) => {
-                let path = directory.join(named(&filename)?);
+                let path = upload_path(directory, &name, &named(&filename)?).await?;
                 let mut file = tokio::fs::File::create(&path).await?;
                 let mut written = 0;
                 while let Some(chunk) = field.chunk().await.map_err(Failure::form)? {
@@ -617,7 +769,10 @@ async fn cancel(
     let mut jobs = server.jobs.lock().expect("the jobs");
     let job = jobs.get_mut(&id).ok_or_else(Failure::unknown)?;
     match job.state {
-        Stage::Queued => job.state = Stage::Cancelled,
+        Stage::Queued => {
+            job.state = Stage::Cancelled;
+            job.finished_at = Some(SystemTime::now());
+        }
         Stage::Running => crate::generation::cancel(),
         Stage::Cancelled => {}
         Stage::Done | Stage::Failed => return Err(Failure::gone("that generation has ended")),
@@ -783,6 +938,44 @@ async fn image(
     written(&server, &id, Output::Picture, "image/png").await
 }
 
+/// The latest preview of a picture, which is 404 until its first step.
+async fn latest_preview(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Response, Failure> {
+    let step = {
+        let jobs = server.jobs.lock().expect("the jobs");
+        jobs.get(&id).ok_or_else(Failure::unknown)?.preview_step
+    };
+    let step = step.ok_or_else(|| Failure(StatusCode::NOT_FOUND, "no preview yet".to_owned()))?;
+    preview(State(server), Path((id, step))).await
+}
+
+/// The preview of a picture after step `step`, counted from 1.
+async fn preview(
+    State(server): State<Arc<Server>>,
+    Path((id, step)): Path<(String, usize)>,
+) -> Result<Response, Failure> {
+    let directory = {
+        let jobs = server.jobs.lock().expect("the jobs");
+        jobs.get(&id)
+            .ok_or_else(Failure::unknown)?
+            .directory
+            .clone()
+    };
+    let path = directory
+        .join(PREVIEWS)
+        .join(crate::image::preview_name(step));
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => Ok(([(header::CONTENT_TYPE, "image/png")], bytes).into_response()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(Failure(
+            StatusCode::NOT_FOUND,
+            format!("no preview of step {step}"),
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// What generation `id` wrote, when it is `output` and it has written it.
 async fn written(
     server: &Server,
@@ -889,6 +1082,28 @@ fn model_named(
         })
 }
 
+/// Where an upload of field `field` named `name` is written: a reference into the job's
+/// `references` directory, numbered when two references share a name, and anything else beside
+/// the job.
+async fn upload_path(
+    directory: &std::path::Path,
+    field: &str,
+    name: &str,
+) -> Result<PathBuf, Failure> {
+    if field != "reference" {
+        return Ok(directory.join(name));
+    }
+    let references = directory.join(REFERENCES);
+    tokio::fs::create_dir_all(&references).await?;
+    let mut path = references.join(name);
+    let mut count = 1;
+    while tokio::fs::try_exists(&path).await? {
+        count += 1;
+        path = references.join(format!("{count}-{name}"));
+    }
+    Ok(path)
+}
+
 /// The file name a client gave, taken down to a name. A name with a directory in it is a name
 /// meant to land somewhere other than where it was sent.
 fn named(filename: &str) -> Result<String, Failure> {
@@ -963,6 +1178,9 @@ impl IntoResponse for Failure {
 mod tests {
     use super::*;
 
+    /// Held by a test that runs a job, since the run's cancellation flag is the process's.
+    static RUNS: Mutex<()> = Mutex::new(());
+
     /// A server with no generating thread, whose queue is handed back for a test to run.
     fn test_server(name: &str) -> (Arc<Server>, std::sync::mpsc::Receiver<String>) {
         let directory =
@@ -1000,15 +1218,23 @@ mod tests {
     }
 
     fn queue_picture(server: &Server) -> String {
+        queue_picture_with(server, &[])
+    }
+
+    fn queue_picture_with(server: &Server, arguments: &[&str]) -> String {
         let id = next_id();
         let directory = server.directory.join(&id);
         std::fs::create_dir_all(&directory).unwrap();
         let written = directory.join("image.png");
+        let arguments = arguments
+            .iter()
+            .map(|&argument| argument.to_owned())
+            .collect();
         queue_job(
             server,
             id.clone(),
             Output::Picture,
-            Vec::new(),
+            arguments,
             directory,
             written,
         )
@@ -1023,6 +1249,9 @@ mod tests {
 
     #[test]
     fn a_cancelled_generation_stops_where_it_is() {
+        let _runs = RUNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (server, waiting) = test_server("cancel");
         let running = queue_picture(&server);
         let queued = queue_picture(&server);
@@ -1037,7 +1266,7 @@ mod tests {
 
         // One running stops at the next step boundary it reaches.
         assert_eq!(waiting.recv().unwrap(), running);
-        generate(&server, &running, |_, _| {
+        generate(&server, &running, |_, _, _| {
             assert_eq!(state(&server, &running), "running");
             crate::generation::check_cancelled()?;
             let (status, body) = answer(block(cancel(
@@ -1052,14 +1281,14 @@ mod tests {
         assert_eq!(state(&server, &running), "cancelled");
 
         assert_eq!(waiting.recv().unwrap(), queued);
-        generate(&server, &queued, |_, _| {
+        generate(&server, &queued, |_, _, _| {
             unreachable!("a cancelled job runs")
         });
         assert_eq!(state(&server, &queued), "cancelled");
 
         // The next run starts with the flag down, and one that has ended cannot be cancelled.
         let done = queue_picture(&server);
-        generate(&server, &done, |_, _| {
+        generate(&server, &done, |_, _, _| {
             crate::generation::check_cancelled()?;
             Ok(())
         });
@@ -1075,6 +1304,168 @@ mod tests {
         )));
         assert_eq!(status, StatusCode::NOT_FOUND);
         std::fs::remove_dir_all(&server.directory).unwrap();
+    }
+
+    #[test]
+    fn a_generation_says_what_was_asked_and_how_it_went() {
+        let _runs = RUNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (server, _waiting) = test_server("shape");
+        let id = queue_picture_with(
+            &server,
+            &[
+                "--out",
+                "image.png",
+                "--prompt",
+                "a cat",
+                "--width",
+                "1024",
+                "--reference",
+                "/jobs/x/references/cat.png",
+                "--reference",
+                "/jobs/x/references/2-cat.png",
+                "--attention",
+                "sol",
+                "--sparse-tau",
+                "1.5",
+                "--draft-steps",
+                "2",
+                "--latent-upscaler",
+                "/models/latent_upscale_models/upscaler.safetensors",
+            ],
+        );
+        let describe = || {
+            answer(block(describe(
+                State(Arc::clone(&server)),
+                Path(id.clone()),
+            )))
+        };
+        let (status, queued) = describe();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(queued["kind"], "image");
+        assert_eq!(queued["state"], "queued");
+        assert_eq!(
+            queued["request"],
+            json!({
+                "prompt": "a cat",
+                "width": 1024,
+                "height": 2048,
+                "seed": 0,
+                "min_generation_area": 4194304,
+                "attention_precision": null,
+                "attention": "sol",
+                "sparse_tau": 1.5,
+                "sparse_start": null,
+                "draft_steps": 2,
+                "latent_upscaler": "upscaler.safetensors",
+                "renoise_sigma": null,
+                "steps": null,
+                "shift": null,
+                "patch": null,
+                "lora": null,
+                "lora_strength": null,
+                "lora_mode": null,
+                "references": ["cat.png", "2-cat.png"],
+            })
+        );
+        assert!(queued["created_at"].is_f64());
+        for field in ["started_at", "finished_at", "timings", "preview_step"] {
+            assert!(queued[field].is_null(), "{field}");
+        }
+        let latest = || {
+            answer(block(latest_preview(
+                State(Arc::clone(&server)),
+                Path(id.clone()),
+            )))
+        };
+        assert_eq!(latest().0, StatusCode::NOT_FOUND);
+
+        let previews = server.directory.join(&id).join(PREVIEWS);
+        generate(&server, &id, |_, _, watch| {
+            std::fs::create_dir_all(&previews)?;
+            std::fs::write(previews.join(crate::image::preview_name(1)), b"png")?;
+            watch(&crate::image::Report {
+                timings: crate::image::Timings {
+                    load_dit: Some(2.0),
+                    steps: vec![1.5],
+                    ..Default::default()
+                },
+                preview_step: Some(1),
+                models: Vec::new(),
+                attention_precision: Some("fp16"),
+            });
+            Ok(())
+        });
+        let (_, done) = describe();
+        assert_eq!(done["state"], "done");
+        assert_eq!(done["preview_step"], 1);
+        assert_eq!(done["request"]["attention_precision"], "fp16");
+        assert_eq!(done["timings"]["steps"], json!([1.5]));
+        assert_eq!(done["timings"]["load_dit"], 2.0);
+        assert!(done["timings"]["decode"].is_null());
+        assert!(done["started_at"].as_f64() <= done["finished_at"].as_f64());
+
+        let response = block(latest_preview(State(Arc::clone(&server)), Path(id.clone())))
+            .unwrap_or_else(IntoResponse::into_response);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        let bytes = block(axum::body::to_bytes(response.into_body(), usize::MAX)).unwrap();
+        assert_eq!(&bytes[..], b"png");
+        let (status, _) = answer(block(preview(
+            State(Arc::clone(&server)),
+            Path((id.clone(), 2)),
+        )));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&server.directory).unwrap();
+    }
+
+    #[test]
+    fn a_picture_says_which_few_step_lora_it_asked_for() {
+        let arguments: Vec<String> = [
+            "--prompt",
+            "a cat",
+            "--steps",
+            "4",
+            "--lora",
+            "/models/loras/pdmd.safetensors",
+            "--draft-steps",
+            "1",
+            "--renoise-sigma",
+            "0.8",
+        ]
+        .map(str::to_owned)
+        .into();
+        let asked = request(&arguments, Output::Picture);
+        assert_eq!(asked["steps"], 4);
+        assert!(asked["shift"].is_null());
+        assert_eq!(asked["renoise_sigma"], 0.8);
+        assert!(asked["patch"].is_null());
+        assert_eq!(asked["lora"], "pdmd.safetensors");
+        assert_eq!(asked["lora_strength"], 1.0);
+        assert_eq!(asked["lora_mode"], "adapter");
+    }
+
+    #[test]
+    fn references_are_uploaded_into_their_own_directory() {
+        let directory = std::env::temp_dir().join(format!("mmh3-uploads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = |field: &str, name: &str| {
+            block(upload_path(&directory, field, name)).unwrap_or_else(|_| unreachable!())
+        };
+        let first = path("reference", "cat.png");
+        assert_eq!(first, directory.join("references/cat.png"));
+        std::fs::write(&first, b"").unwrap();
+        assert_eq!(
+            path("reference", "cat.png"),
+            directory.join("references/2-cat.png")
+        );
+        assert_eq!(
+            path("prompt-file", "prompt.txt"),
+            directory.join("prompt.txt")
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
