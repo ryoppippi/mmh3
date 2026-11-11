@@ -8,7 +8,7 @@ usage() {
 usage: $0 [--video-vae int8|fp16] [--ref2va | --no-ref2va] [--fasth3 | --no-fasth3]
        [--lightx2v-turbo | --no-lightx2v-turbo] [--taomate | --no-taomate] [--pdmd | --no-pdmd]
        [--dmad | --no-dmad] [--veda | --no-veda] [--latent-upscaler | --no-latent-upscaler]
-       [--models DIR]
+       [--image] [--models DIR]
 
 Downloads the checkpoints mmh3 loads from Hugging Face with the Hugging Face CLI (hf), or with curl
 when hf is not installed. curl sends HF_TOKEN when it is set. By default it downloads the ones make
@@ -38,6 +38,9 @@ VSA-DataFree patch.
   --latent-upscaler    LBH-123-AI's latent upscaler for draft steps from
                        LBH-123-AI/Minimax_h3_latent_Upscaler, into latent_upscale_models.
   --no-latent-upscaler No latent upscaler (default).
+  --image              The checkpoints of mmh3 image instead, from Comfy-Org/MiniMax-H3-Image: the
+                       INT8 ConvRot image DiT and text encoder and the FP16 image VAE. The other
+                       options are ignored.
   --models DIR         The models directory (default: models in the repository).
 EOF
 }
@@ -56,6 +59,7 @@ pdmd=0
 dmad=0
 veda=0
 latent_upscaler=0
+image=0
 models=$(cd "$(dirname "$0")/.." && pwd)/models
 
 while [[ $# -gt 0 ]]; do
@@ -81,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --no-veda) veda=0 ;;
     --latent-upscaler) latent_upscaler=1 ;;
     --no-latent-upscaler) latent_upscaler=0 ;;
+    --image) image=1 ;;
     --models)
       [[ $# -ge 2 ]] || fail "--models needs a directory"
       models=$2
@@ -130,6 +135,14 @@ download() {
 
 if ! command -v hf >/dev/null && ! command -v curl >/dev/null; then
   fail "neither the Hugging Face CLI (hf) nor curl is installed"
+fi
+
+if [[ $image == 1 ]]; then
+  download Comfy-Org/MiniMax-H3-Image "$models" \
+    diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors \
+    text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
+    vae/minimax_h3_image_vae_fp16.safetensors
+  exit
 fi
 
 files=(

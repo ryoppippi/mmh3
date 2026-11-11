@@ -11,6 +11,11 @@ else
 FEATURES = cuda,mp4,server
 endif
 SEED = 1
+# mmh3 image writes a PNG, 4096 × 4096 unless IMAGE_OPTIONS say otherwise, such as --width 2048
+# --height 2048.
+IMAGE_OUT = out.png
+IMAGE_OPTIONS =
+export IMAGE_PROMPT = A woman in a yellow raincoat holds a clear umbrella on a neon-lit Tokyo street at night, rain streaking through the pink and blue light, reflections on the wet asphalt, shot on a 35 mm lens.
 export PROMPT = A woman in a yellow raincoat opens a clear umbrella on a neon-lit Tokyo street at night. Rain patters on the umbrella, with distant traffic and soft piano music.
 
 comma := ,
@@ -60,9 +65,22 @@ generate: build
 		$(GENERATE_OPTIONS) \
 		$(OUTPUT_OPTIONS)
 
+.PHONY: generate-image
+generate-image: build
+	target/release/mmh3 image \
+		--models "$(MODELS)" \
+		--out "$(IMAGE_OUT)" \
+		--prompt "$$IMAGE_PROMPT" \
+		--seed $(SEED) \
+		$(IMAGE_OPTIONS)
+
 .PHONY: download-models
 download-models:
 	tools/download-models.sh --models "$(MODELS)" $(LORA_DOWNLOAD_$(LORA))
+
+.PHONY: download-image-models
+download-image-models:
+	tools/download-models.sh --models "$(MODELS)" --image
 
 # Formats the Rust code with rustfmt, the Python tools with ruff, the Swift code with swiftformat
 # and the C++, CUDA and Metal code with clang-format. uvx runs pinned formatter versions, so the
