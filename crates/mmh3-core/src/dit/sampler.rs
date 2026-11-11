@@ -51,6 +51,30 @@ impl Schedule {
         Self::retained(50, &[0, 16, 33, 49], shift_video, shift_audio)
     }
 
+    /// The fixed grid a PDD checkpoint was distilled on, one step per head of its bank, with no
+    /// shift. Every sigma but the last goes through its FP32 timestep `1 − sigma` and back, as the
+    /// released sampler rounds them, so that the DiT sees the reference's timesteps and the Euler
+    /// steps span the reference's intervals. The audio schedule repeats the video one, since such
+    /// a checkpoint has no audio stream.
+    pub fn pdd(sigmas: &[f64]) -> Self {
+        assert!(
+            sigmas.len() >= 2
+                && sigmas[0] == 1.0
+                && sigmas[sigmas.len() - 1] == 0.0
+                && sigmas.windows(2).all(|pair| pair[1] < pair[0]),
+            "a PDD grid falls from 1 to 0"
+        );
+        let video: Vec<f32> = sigmas[..sigmas.len() - 1]
+            .iter()
+            .map(|&sigma| 1.0 - (1.0 - sigma) as f32)
+            .chain([0.0])
+            .collect();
+        Schedule {
+            audio: video.clone(),
+            video,
+        }
+    }
+
     pub fn steps(&self) -> usize {
         self.video.len() - 1
     }
@@ -117,6 +141,36 @@ mod tests {
         for (actual, expected) in schedule.audio.iter().zip(expected_audio) {
             assert!((actual - expected).abs() < 1e-5, "{:?}", schedule.audio);
         }
+    }
+
+    #[test]
+    fn rounds_the_pdd_grid_through_its_timesteps() {
+        let grid = [
+            1.0,
+            0.9675236940383911,
+            0.8875485062599182,
+            0.75,
+            0.5327739119529724,
+            0.23200887441635132,
+            0.0,
+        ];
+        let schedule = Schedule::pdd(&grid);
+        assert_eq!(schedule.steps(), 6);
+        assert_eq!(schedule.audio, schedule.video);
+        for (step, &sigma) in schedule.video.iter().enumerate() {
+            assert_eq!(sigma, grid[step] as f32);
+        }
+        // A grid off the FP32 values moves by the round trip, and the DiT's own `1 − sigma` gives
+        // back the reference's timestep.
+        let off = [1.0, 0.3000000000000001, 0.1, 0.0];
+        let schedule = Schedule::pdd(&off);
+        for (step, &sigma) in off[..off.len() - 1].iter().enumerate() {
+            let timestep = (1.0 - sigma) as f32;
+            assert_eq!(schedule.video[step], 1.0 - timestep);
+            assert_eq!(1.0 - schedule.video[step], timestep);
+        }
+        assert_ne!(schedule.video[2], 0.1f32);
+        assert_eq!(schedule.video[3], 0.0);
     }
 
     #[test]
