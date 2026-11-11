@@ -49,11 +49,13 @@ impl Reference {
     }
 }
 
-/// Inputs of one DiT call for text-to-video with audio.
+/// Inputs of one DiT call for text-to-video with audio, or for text-to-image with a checkpoint
+/// without the audio stream.
 pub struct DitInputs {
-    /// Normalized video latent `[channels, frames, height, width]`.
+    /// Normalized video latent `[channels, frames, height, width]`, one frame for an image.
     pub video: Tensor,
-    /// Normalized audio latent `[channels, 2, frames]`.
+    /// Normalized audio latent `[channels, 2, frames]`, `[0, 2, 0]` for a checkpoint without the
+    /// audio stream.
     pub audio: Tensor,
     /// Text encoder hidden states `[tokens, text_dim]`.
     pub context: Tensor,
@@ -65,4 +67,14 @@ pub struct DitInputs {
     pub sigma: f32,
     pub shift_video: f32,
     pub shift_audio: f32,
+    /// The head of a PDD checkpoint's bank this call projects with, which is the step's index on
+    /// the bank's grid. 0 for a checkpoint with a plain head.
+    pub pdd_step: usize,
+}
+
+impl DitInputs {
+    /// The audio latent of a call to a checkpoint without the audio stream.
+    pub fn no_audio() -> Tensor {
+        Tensor::new(vec![0, 2, 0], Vec::new())
+    }
 }

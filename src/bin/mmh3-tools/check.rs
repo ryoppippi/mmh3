@@ -292,6 +292,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         sigma: sigma as f32,
         shift_video: dit_file.metadata("shift_video")?.parse()?,
         shift_audio: dit_file.metadata("shift_audio")?.parse()?,
+        pdd_step: 0,
     };
 
     // `--shard 1` runs the path a shared-out step takes, with one rank and nothing to carry
@@ -789,6 +790,7 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             sigma: schedule.video[step],
             shift_video,
             shift_audio,
+            pdd_step: 0,
         };
         let step_sparse =
             sparse.filter(|settings| settings.applies_to_step(step, schedule.steps()));

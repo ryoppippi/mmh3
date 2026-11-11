@@ -68,6 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sigma: 0.7,
         shift_video: 3.0,
         shift_audio: 3.0,
+        pdd_step: 0,
     };
 
     let dit = MetalDit::load(&file, "weight.")?;

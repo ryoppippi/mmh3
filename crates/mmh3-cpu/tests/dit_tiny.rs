@@ -102,6 +102,7 @@ fn matches_comfyui_golden_forward() {
         sigma: tensor(&file, "input.timestep").data[0] / 1000.0,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
+        pdd_step: 0,
     };
     let trace = forward(&DitWeights::new(tensors), &config, &inputs);
 

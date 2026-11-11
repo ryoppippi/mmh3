@@ -107,6 +107,7 @@ fn applies_a_lora_like_merged_weights() {
             / 1000.0,
         shift_video: 12.0,
         shift_audio: 3.0,
+        pdd_step: 0,
     };
     let base = mmh3_cpu::dit::forward(
         &mmh3_cpu::dit::DitWeights::new(weights.clone()),

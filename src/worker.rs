@@ -3873,6 +3873,7 @@ fn serve_shard(
         sigma: 1.0,
         shift_video: open.shift_video,
         shift_audio: open.shift_audio,
+        pdd_step: 0,
     };
     let tokens = PackedLayout::for_inputs(&inputs).len();
     let sparse = sparse_attention(&open.sparse);

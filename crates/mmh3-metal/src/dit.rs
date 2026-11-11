@@ -1223,6 +1223,7 @@ mod tests {
             sigma: 0.5,
             shift_video: 6.0,
             shift_audio: 3.0,
+            pdd_step: 0,
         }
     }
 

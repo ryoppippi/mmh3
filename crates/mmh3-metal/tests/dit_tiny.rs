@@ -81,6 +81,7 @@ fn check_forward() {
         sigma: tensor(&file, "input.timestep").data[0] / 1000.0,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
+        pdd_step: 0,
     };
 
     let outputs = dit.forward(&inputs, &[0, 1], None).unwrap();
@@ -219,6 +220,7 @@ fn follows_the_cpu_reference_with_keyframes() {
         sigma: 0.6,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
+        pdd_step: 0,
     };
 
     let expected = cpu_forward(&file, &inputs);
@@ -273,6 +275,7 @@ fn follows_the_cpu_reference_with_references() {
         sigma: 0.6,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
+        pdd_step: 0,
     };
 
     let expected = cpu_forward(&file, &inputs);
@@ -310,6 +313,7 @@ fn adapter_lora_matches_a_cpu_weight_update() {
         sigma: 0.6,
         shift_video: 12.0,
         shift_audio: 3.0,
+        pdd_step: 0,
     };
 
     let mut tensors: HashMap<_, _> = file

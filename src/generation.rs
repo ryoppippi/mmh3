@@ -941,6 +941,7 @@ pub fn sample(
                 sigma: schedule.video[step],
                 shift_video: settings.shift_video,
                 shift_audio: settings.shift_audio,
+                pdd_step: 0,
             };
             let step_sparse = sparse.filter(|settings| settings.applies_to_step(step, steps));
             // The velocity of this step and, where a whole one ran here, what Sol-Attn routed.
@@ -1567,6 +1568,7 @@ fn shard_target(
         sigma: 1.0,
         shift_video: settings.shift_video,
         shift_audio: settings.shift_audio,
+        pdd_step: 0,
     };
     let tokens = PackedLayout::for_inputs(&inputs).len();
     let shape = |dimensions: &[usize]| -> Vec<u32> {

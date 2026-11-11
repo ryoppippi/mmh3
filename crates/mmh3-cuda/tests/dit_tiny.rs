@@ -81,6 +81,7 @@ fn check_forward(precision: AttentionPrecision) {
         sigma: tensor(&file, "input.timestep").data[0] / 1000.0,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
+        pdd_step: 0,
     };
     let outputs = dit.forward(&inputs, &[0, 1], None).unwrap();
     assert_close(
@@ -208,6 +209,7 @@ fn follows_the_cpu_reference_with_keyframes() {
         sigma: 0.6,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
+        pdd_step: 0,
     };
     let expected = cpu_forward(&file, &inputs);
 
@@ -260,6 +262,7 @@ fn follows_the_cpu_reference_with_references() {
         sigma: 0.6,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
+        pdd_step: 0,
     };
     let expected = cpu_forward(&file, &inputs);
 
@@ -305,6 +308,7 @@ fn matches_comfyui_golden_with_references() {
         sigma: metadata_number(&file, "sigma"),
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
+        pdd_step: 0,
     };
     let dit = CudaDit::load(&file, "weight.").unwrap();
     let outputs = dit.forward(&inputs, &[], None).unwrap();
@@ -334,6 +338,7 @@ fn copies_a_dit_that_reads_blocks_on_the_way() {
         sigma: tensor(&file, "input.timestep").data[0] / 1000.0,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
+        pdd_step: 0,
     };
     let whole = dit.forward(&inputs, &[], None).unwrap();
     let same = |outputs: &mmh3_cuda::dit::DitOutputs| {
