@@ -194,7 +194,8 @@ curl -N http://localhost:8833/v1/events
 
 One stream for every generation of the server. It starts with a `snapshot`, which is what
 `GET /v1/generations` answers, and then says a `generation` with the whole generation whenever one
-changes state or step, and a `preview` whenever a picture has a new preview:
+changes state or step, a `preview` whenever a picture has a new preview, and a `removed` with its
+`id` whenever one is taken away:
 
 ```
 event: snapshot
@@ -206,11 +207,16 @@ data: {"id":"6af4fadf0000","kind":"image","state":"running","step":2,"steps":6,.
 event: preview
 data: {"id":"6af4fadf0000","step":2,"steps":6,"url":"/v1/generations/6af4fadf0000/preview/2"}
 
+event: removed
+data: {"id":"6ab1cf3b0000"}
+
 : keep-alive
 ```
 
-A comment every 15 s keeps the stream alive while nothing happens. A client that falls too far
-behind is sent a new `snapshot` in place of what it missed. The stream does not end.
+Each change of state is said as it is made, so a generation queued and started at once is said
+`queued` and then `running`. A comment every 15 s keeps the stream alive while nothing happens. A
+client that falls too far behind is sent a new `snapshot` in place of what it missed, and nothing
+from before that snapshot after it. The stream does not end.
 
 ## Cancelling one
 
@@ -246,10 +252,12 @@ Each generation has a directory of its own under the jobs directory, named by it
   `power_mode` (`automatic`, `low` or `high`) and its `adapter_watts`, `null` on battery.
   `gpu_clock_mhz_median` is `null`, since only `powermetrics` reads the GPU's clock, as root.
 
-A server writes `metadata.json` as a generation starts and as it ends, and reads every one under the
-jobs directory back when it starts, so the generations of the server before it are listed again,
-the most recent first, and their pictures and previews are there to be taken. One that was waiting
-or running when that server stopped is `failed`, since it never ended.
+A server writes `metadata.json` as a generation is queued, whenever it changes state and at each
+step it reports, and reads every one under the jobs directory back when it starts, so the
+generations of the server before it are listed again, the most recent first, and their pictures
+and previews are there to be taken. One that was waiting or running when that server stopped is
+`failed`, since it never ended, with the steps and the previews it had and the time its metadata
+was last written as its `finished_at`.
 
 ## What a server holds
 

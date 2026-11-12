@@ -208,8 +208,8 @@ struct Job {
     timings: serde_json::Value,
     /// The last step with a preview in the job's `previews` directory.
     preview_step: Option<usize>,
-    /// The checkpoints the run read.
-    models: Vec<PathBuf>,
+    /// What made it, as its metadata says: `{models, mmh3, machine}`.
+    provenance: serde_json::Value,
 }
 
 impl Job {
@@ -229,8 +229,18 @@ impl Job {
             seconds: None,
             timings: serde_json::Value::Null,
             preview_step: None,
-            models: Vec::new(),
+            provenance: provenance(serde_json::Value::Null),
         }
+    }
+
+    /// What its `metadata.json` says: the generation as the server describes it, with what made
+    /// it.
+    fn metadata(&self, id: &str) -> serde_json::Value {
+        let mut metadata = self.describe(id);
+        for field in ["models", "mmh3", "machine"] {
+            metadata[field] = self.provenance[field].clone();
+        }
+        metadata
     }
 
     fn describe(&self, id: &str) -> serde_json::Value {
@@ -269,40 +279,47 @@ impl Job {
             "write": timings.write,
         });
         self.preview_step = report.preview_step;
-        self.models = report.models.clone();
         if let Some(precision) = report.attention_precision {
             self.request["attention_precision"] = precision.into();
         }
     }
 }
 
-/// A job of an earlier run of the server from what its directory's metadata says, or None for a
-/// directory that is not a job's. A job that was waiting or running when that server stopped never
-/// ended, and is restored failed.
-fn restore(directory: &std::path::Path) -> Option<Job> {
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(directory.join(METADATA)).ok()?).ok()?;
-    let output = match metadata["kind"].as_str()? {
-        "image" => Output::Picture,
-        "video" => Output::Video,
-        _ => return None,
-    };
-    let (state, failure) = match metadata["state"].as_str()? {
-        "done" => (Stage::Done, None),
-        "failed" => (Stage::Failed, metadata["error"].as_str().map(str::to_owned)),
-        "cancelled" => (Stage::Cancelled, None),
-        "queued" | "running" => (Stage::Failed, Some(INTERRUPTED.to_owned())),
-        _ => return None,
-    };
-    let written = match output {
+/// What made a generation, as its metadata says: the checkpoints it read, the build of mmh3 and
+/// `machine`, the machine that ran it, which is null for one that has not run.
+fn provenance(machine: serde_json::Value) -> serde_json::Value {
+    json!({ "models": [], "mmh3": crate::provenance::build(), "machine": machine })
+}
+
+/// Where a job in `directory` writes what it generates. A video's container is the one of the
+/// server that wrote it, which need not be this one's.
+fn written_in(directory: &std::path::Path, output: Output) -> PathBuf {
+    match output {
         Output::Picture => directory.join("image.png"),
-        // The container is the one of the server that wrote it, which need not be this one's.
         Output::Video => std::fs::read_dir(directory)
-            .ok()?
+            .into_iter()
+            .flatten()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .find(|path| path.file_stem().is_some_and(|stem| stem == "video"))
             .unwrap_or_else(|| directory.join("video")),
+    }
+}
+
+/// A job of an earlier run of the server from what its directory's metadata says, and whether
+/// what it says has been put right and wants writing again; or why it cannot be restored. A job
+/// that was waiting or running when that server stopped never ended, and is restored failed, as
+/// having ended when its metadata was last written.
+fn restore(directory: &std::path::Path) -> Result<(Job, bool), String> {
+    let path = directory.join(METADATA);
+    let metadata: serde_json::Value = std::fs::read(&path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+        .map_err(|error| format!("its {METADATA} cannot be read: {error}"))?;
+    let output = match metadata["kind"].as_str() {
+        Some("image") => Output::Picture,
+        Some("video") => Output::Video,
+        _ => return Err(format!("its {METADATA} names no kind of generation")),
     };
     let time = |field: &str| {
         metadata[field]
@@ -310,23 +327,48 @@ fn restore(directory: &std::path::Path) -> Option<Job> {
             .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
             .map(|seconds| UNIX_EPOCH + Duration::from_secs_f64(seconds))
     };
-    Some(Job {
-        state,
-        arguments: Vec::new(),
-        directory: directory.to_owned(),
+    let (state, failure, finished_at, interrupted) = match metadata["state"].as_str() {
+        Some("done") => (Stage::Done, None, time("finished_at"), false),
+        Some("failed") => (
+            Stage::Failed,
+            metadata["error"].as_str().map(str::to_owned),
+            time("finished_at"),
+            false,
+        ),
+        Some("cancelled") => (Stage::Cancelled, None, time("finished_at"), false),
+        Some("queued" | "running") => (
+            Stage::Failed,
+            Some(INTERRUPTED.to_owned()),
+            std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+            true,
+        ),
+        _ => return Err(format!("its {METADATA} names no state")),
+    };
+    let queued = time("created_at")
+        .ok_or_else(|| format!("its {METADATA} does not say when it was asked for"))?;
+    let mut job = Job::new(
         output,
-        written,
-        failure,
-        request: metadata["request"].clone(),
-        queued: time("created_at")?,
-        started: None,
-        started_at: time("started_at"),
-        finished_at: time("finished_at"),
-        seconds: metadata["seconds"].as_f64(),
-        timings: metadata["timings"].clone(),
-        preview_step: metadata["preview_step"].as_u64().map(|step| step as usize),
-        models: Vec::new(),
-    })
+        Vec::new(),
+        directory.to_owned(),
+        written_in(directory, output),
+    );
+    job.state = state;
+    job.failure = failure;
+    job.request = metadata["request"].clone();
+    job.queued = queued;
+    job.started_at = time("started_at");
+    job.finished_at = finished_at;
+    job.seconds = metadata["seconds"].as_f64();
+    job.timings = metadata["timings"].clone();
+    job.preview_step = metadata["preview_step"].as_u64().map(|step| step as usize);
+    job.provenance = json!({
+        "models": metadata["models"],
+        "mmh3": metadata["mmh3"],
+        "machine": metadata["machine"],
+    });
+    Ok((job, interrupted))
 }
 
 /// Every job under the jobs directory `directory` that a server before this one left, by id.
@@ -334,50 +376,50 @@ fn restore_all(directory: &std::path::Path) -> HashMap<String, Job> {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return HashMap::new();
     };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let id = entry.file_name().into_string().ok()?;
-            let job = restore(&entry.path())?;
-            // What the metadata said of a job that never ended is put right, so that it says so
-            // the next time too.
-            if job.failure.as_deref() == Some(INTERRUPTED) {
-                write_metadata(&job.directory, job.describe(&id), &[]);
-            }
-            Some((id, job))
-        })
-        .collect()
+    let mut jobs = HashMap::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(id) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok((job, put_right)) = restore(&path) else {
+            continue;
+        };
+        // What the metadata said of a job is put right, so that it says so the next time too.
+        if put_right {
+            persist(&job, &id);
+        }
+        jobs.insert(id, job);
+    }
+    jobs
 }
 
 /// Why a job restored waiting or running failed.
 const INTERRUPTED: &str = "the server stopped before this generation ended";
 
-/// Writes a job's `metadata.json` beside what it wrote: `described`, the generation as the server
-/// describes it, with the checkpoints it read, the build of mmh3 and the machine. It is written
-/// beside and renamed, so that a server starting never reads half of one. A job that cannot have
-/// its metadata written still runs, and says so.
-fn write_metadata(
-    directory: &std::path::Path,
-    mut described: serde_json::Value,
-    models: &[PathBuf],
-) {
-    described["models"] = models
-        .iter()
-        .map(|path| crate::provenance::model(path))
-        .collect();
-    described["mmh3"] = crate::provenance::build();
-    described["machine"] = crate::provenance::machine();
-    let partial = directory.join(format!(".{METADATA}"));
-    let written = serde_json::to_vec_pretty(&described)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(&partial, bytes))
-        .and_then(|()| std::fs::rename(&partial, directory.join(METADATA)));
-    if let Err(error) = written {
+/// Writes a job's `metadata.json` beside what it wrote. A job that cannot have its metadata written
+/// still runs, and says so.
+fn persist(job: &Job, id: &str) {
+    if let Err(error) = write_metadata(&job.directory, &job.metadata(id)) {
         eprintln!(
             "warning: writing the metadata of {}: {error}",
-            directory.display()
+            job.directory.display()
         );
     }
+}
+
+/// Writes `metadata` as the `metadata.json` of `directory`. It is written beside and renamed, so
+/// that a server starting never reads half of one.
+fn write_metadata(
+    directory: &std::path::Path,
+    metadata: &serde_json::Value,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let partial = directory.join(format!(".{METADATA}"));
+    let bytes = serde_json::to_vec_pretty(metadata).map_err(std::io::Error::other)?;
+    std::fs::File::create(&partial)?.write_all(&bytes)?;
+    std::fs::rename(&partial, directory.join(METADATA))
 }
 
 fn unix_seconds(time: SystemTime) -> f64 {
@@ -479,8 +521,35 @@ struct Server {
     ffmpeg: Option<Vec<String>>,
     container: Container,
     directory: PathBuf,
-    /// What the stream of every generation says next, as an event's name and its data.
+    /// What the stream of every generation says next, as an event's name and its data. It is
+    /// only sent to under the lock of `jobs`, so that what a client is sent after a snapshot taken
+    /// under that lock is never older than the snapshot.
     announcements: tokio::sync::broadcast::Sender<Announcement>,
+    /// What was last announced of each generation, which is taken under the lock of `jobs`.
+    said: Mutex<HashMap<String, serde_json::Value>>,
+}
+
+impl Server {
+    /// Says what has changed of the generations `jobs`, which are this server's under its lock, to
+    /// the clients of `GET /v1/events`.
+    fn announce(&self, jobs: &HashMap<String, Job>) {
+        let mut said = self.said.lock().expect("what was said");
+        for announcement in changes(jobs, &mut said) {
+            // Nobody listening is not a failure to say it.
+            let _ = self.announcements.send(announcement);
+        }
+    }
+
+    /// Writes down and announces what changed of the job `id` of `jobs`, which are this server's
+    /// under its lock. Each change is told as it is made, so that two never merge into one, and a
+    /// job's metadata is only written while it is in `jobs`, so that it never comes back after
+    /// `forget` took it away.
+    fn changed(&self, jobs: &HashMap<String, Job>, id: &str) {
+        if let Some(job) = jobs.get(id) {
+            persist(job, id);
+        }
+        self.announce(jobs);
+    }
 }
 
 /// An event of `GET /v1/events`: its name and its data.
@@ -610,6 +679,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         container,
         directory: directory.clone(),
         announcements: tokio::sync::broadcast::channel(ANNOUNCEMENTS).0,
+        said: Mutex::new(HashMap::new()),
     });
 
     // The generations run here, one after another, off the runtime that answers the requests. A
@@ -649,7 +719,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(&listen).await?;
         println!("serving on {listen}, jobs in {}", directory.display());
-        tokio::spawn(announce(server));
+        tokio::spawn(announce_steps(server));
         axum::serve(listener, application).await
     })?;
     Ok(())
@@ -665,38 +735,49 @@ fn generate(
     id: &str,
     run: impl FnOnce(&[String], Output, &mut Reporting) -> Result<(), Box<dyn Error>>,
 ) {
-    let (arguments, output, directory, described) = {
+    // Asked before the lock is taken, since it asks other programs.
+    let machine = crate::provenance::machine();
+    let (arguments, output) = {
         let mut jobs = server.jobs.lock().expect("the jobs");
         let Some(job) = jobs.get_mut(id) else {
             return;
         };
-        // A job cancelled while it waited is dropped here, with its metadata written as for any
-        // other end.
+        // A job cancelled while it waited is dropped here. Its metadata was written as it was
+        // cancelled.
         if job.state != Stage::Queued {
-            let (directory, described) = (job.directory.clone(), job.describe(id));
-            drop(jobs);
-            write_metadata(&directory, described, &[]);
             return;
         }
         job.state = Stage::Running;
         job.started = Some(Instant::now());
         job.started_at = Some(SystemTime::now());
+        job.provenance["machine"] = machine;
         // Under the lock, so that a cancel of this job, which takes the lock to see it running,
         // comes after the flag of the run before it is cleared.
         crate::generation::starting();
-        (
-            job.arguments.clone(),
-            job.output,
-            job.directory.clone(),
-            job.describe(id),
-        )
+        let started = (job.arguments.clone(), job.output);
+        // Written as it starts too, so that a server stopped during it restores it as failed.
+        server.changed(&jobs, id);
+        started
     };
     println!("generation {id} begins");
-    // Written as it starts too, so that a server stopped during it restores it as failed.
-    write_metadata(&directory, described, &[]);
+    let mut read = Vec::new();
+    let mut models = serde_json::Value::Array(Vec::new());
     let mut watch = |report: &crate::image::Report| {
-        if let Some(job) = server.jobs.lock().expect("the jobs").get_mut(id) {
+        // Read before the lock is taken, since it reads the checkpoints.
+        if report.models != read {
+            read.clone_from(&report.models);
+            models = read
+                .iter()
+                .map(|path| crate::provenance::model(path))
+                .collect();
+        }
+        let mut jobs = server.jobs.lock().expect("the jobs");
+        if let Some(job) = jobs.get_mut(id) {
             job.take_report(report);
+            job.provenance["models"] = models.clone();
+            // Written at every report, so that a server stopped during it restores the steps
+            // and the previews it had.
+            server.changed(&jobs, id);
         }
     };
     let generated = run(&arguments, output, &mut watch);
@@ -721,9 +802,8 @@ fn generate(
             job.failure = Some(error.to_string());
         }
     }
-    let (described, models) = (job.describe(id), job.models.clone());
-    drop(jobs);
-    write_metadata(&directory, described, &models);
+    // Under the lock, so that a DELETE that sees it ended finds its metadata written.
+    server.changed(&jobs, id);
 }
 
 /// Takes a generation, and answers with the job rather than with the video, which is not there
@@ -801,11 +881,13 @@ fn queue_job(
 ) -> Result<Response, Failure> {
     let job = Job::new(output, arguments, directory, written);
     let described = job.describe(&id);
-    server
-        .jobs
-        .lock()
-        .expect("the jobs")
-        .insert(id.clone(), job);
+    {
+        let mut jobs = server.jobs.lock().expect("the jobs");
+        jobs.insert(id.clone(), job);
+        // Written as it is queued, so that a server stopped before it ran restores it as failed
+        // rather than leaving its directory behind.
+        server.changed(&jobs, &id);
+    }
     if server.queue.send(id.clone()).is_err() {
         return Err(Failure::gone("nothing is generating any more"));
     }
@@ -887,10 +969,12 @@ async fn forget(
 ) -> Result<Response, Failure> {
     let directory = {
         let mut jobs = server.jobs.lock().expect("the jobs");
-        match jobs.get(&id).ok_or_else(Failure::unknown)?.state {
+        let directory = match jobs.get(&id).ok_or_else(Failure::unknown)?.state {
             Stage::Running => return Err(Failure::gone("that generation is running")),
             _ => jobs.remove(&id).expect("just looked").directory,
-        }
+        };
+        server.announce(&jobs);
+        directory
     };
     // A job that never wrote anything has nothing here, which is not a failure to remove it.
     if let Err(error) = tokio::fs::remove_dir_all(&directory).await
@@ -913,12 +997,13 @@ async fn cancel(
         Stage::Queued => {
             job.state = Stage::Cancelled;
             job.finished_at = Some(SystemTime::now());
+            server.changed(&jobs, &id);
         }
         Stage::Running => crate::generation::cancel(),
         Stage::Cancelled => {}
         Stage::Done | Stage::Failed => return Err(Failure::gone("that generation has ended")),
     }
-    Ok((StatusCode::ACCEPTED, Json(job.describe(&id))).into_response())
+    Ok((StatusCode::ACCEPTED, Json(jobs[&id].describe(&id))).into_response())
 }
 
 /// Every generation this server has been asked for, the most recent first.
@@ -928,7 +1013,11 @@ async fn list(State(server): State<Arc<Server>>) -> Response {
 
 /// `{generations: [...]}`, every generation the most recent first.
 fn generations(server: &Server) -> serde_json::Value {
-    let jobs = server.jobs.lock().expect("the jobs");
+    generations_of(&server.jobs.lock().expect("the jobs"))
+}
+
+/// `{generations: [...]}`, every one of `jobs` the most recent first.
+fn generations_of(jobs: &HashMap<String, Job>) -> serde_json::Value {
     // Ids count up within a run of the server, which orders two asked for in the same instant.
     let mut described: Vec<(SystemTime, &String, serde_json::Value)> = jobs
         .iter()
@@ -941,13 +1030,21 @@ fn generations(server: &Server) -> serde_json::Value {
     json!({ "generations": generations })
 }
 
-/// What has changed of the server's generations since `said`, which is what was last said of
-/// each, as the events of `GET /v1/events`: a `generation` for each one that changed, and a
-/// `preview` for each with a new preview.
-fn changes(server: &Server, said: &mut HashMap<String, serde_json::Value>) -> Vec<Announcement> {
-    let jobs = server.jobs.lock().expect("the jobs");
-    said.retain(|id, _| jobs.contains_key(id));
+/// What has changed of the generations `jobs` since `said`, which is what was last said of each,
+/// as the events of `GET /v1/events`: a `removed` for each one taken away, a `generation` for each
+/// one that changed, and a `preview` for each with a new preview.
+fn changes(
+    jobs: &HashMap<String, Job>,
+    said: &mut HashMap<String, serde_json::Value>,
+) -> Vec<Announcement> {
     let mut changes = Vec::new();
+    said.retain(|id, _| {
+        let kept = jobs.contains_key(id);
+        if !kept {
+            changes.push(("removed", json!({ "id": id })));
+        }
+        kept
+    });
     for (id, job) in jobs.iter() {
         let described = job.describe(id);
         let before = said.get(id);
@@ -977,42 +1074,48 @@ fn changes(server: &Server, said: &mut HashMap<String, serde_json::Value>) -> Ve
     changes
 }
 
-/// Tells the clients of `GET /v1/events` what changed, as often as a client watching one
-/// generation looks.
-async fn announce(server: Arc<Server>) {
-    let mut said = HashMap::new();
-    // What was there before anybody could listen is in every client's snapshot.
-    changes(&server, &mut said);
+/// Tells the clients of `GET /v1/events` of the steps a generation takes, as often as a client
+/// watching one generation looks. What else changes is told where it is changed.
+async fn announce_steps(server: Arc<Server>) {
     loop {
         tokio::time::sleep(WATCH).await;
-        for announcement in changes(&server, &mut said) {
-            // Nobody listening is not a failure to say it.
-            let _ = server.announcements.send(announcement);
-        }
+        server.announce(&server.jobs.lock().expect("the jobs"));
     }
 }
 
 /// Every generation as it happens, in one stream: a `snapshot` of all of them first, then a
-/// `generation` whenever one changes and a `preview` whenever one has a new preview. A client
-/// that falls behind is sent another snapshot.
+/// `generation` whenever one changes, a `preview` whenever one has a new preview and a `removed`
+/// whenever one is taken away. A client that falls behind is sent another snapshot, and nothing
+/// older than it.
 async fn all_events(
     State(server): State<Arc<Server>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     use futures_util::StreamExt;
 
-    // Listening before the snapshot is taken, so that nothing falls between the two.
-    let listening = server.announcements.subscribe();
+    // Listening from where the snapshot is taken, under the lock announcements are sent under, so
+    // that nothing falls between the two and nothing from before the snapshot follows it.
+    let (listening, snapshot) = {
+        let jobs = server.jobs.lock().expect("the jobs");
+        (server.announcements.subscribe(), generations_of(&jobs))
+    };
     let snapshot = Event::default()
         .event("snapshot")
-        .data(generations(&server).to_string());
+        .data(snapshot.to_string());
     let announcements = unfold((server, listening), |(server, mut listening)| async move {
         use tokio::sync::broadcast::error::RecvError;
 
         let event = match listening.recv().await {
             Ok((name, data)) => Event::default().event(name).data(data.to_string()),
-            Err(RecvError::Lagged(_)) => Event::default()
-                .event("snapshot")
-                .data(generations(&server).to_string()),
+            Err(RecvError::Lagged(_)) => {
+                let snapshot = {
+                    let jobs = server.jobs.lock().expect("the jobs");
+                    listening = listening.resubscribe();
+                    generations_of(&jobs)
+                };
+                Event::default()
+                    .event("snapshot")
+                    .data(snapshot.to_string())
+            }
             Err(RecvError::Closed) => return None,
         };
         Some((Ok(event), (server, listening)))
@@ -1426,6 +1529,7 @@ mod tests {
             container: Container::Mp4,
             directory,
             announcements: tokio::sync::broadcast::channel(ANNOUNCEMENTS).0,
+            said: Mutex::new(HashMap::new()),
         });
         (server, waiting)
     }
@@ -1527,6 +1631,7 @@ mod tests {
             Path(done.clone()),
         )));
         assert_eq!(status, StatusCode::CONFLICT);
+
         let (status, _) = answer(block(cancel(
             State(Arc::clone(&server)),
             Path("nothing".to_owned()),
@@ -1684,6 +1789,15 @@ mod tests {
         let done = queue_picture_with(&server, &["--prompt", "a dog"]);
         let cancelled = queue_picture(&server);
         let interrupted = queue_picture(&server);
+        // One still waiting when the server stops, and one cancelled while it waited that the
+        // queue never reached.
+        let waiting_still = queue_picture(&server);
+        let cancelled_waiting = queue_picture(&server);
+        block(cancel(
+            State(Arc::clone(&server)),
+            Path(cancelled_waiting.clone()),
+        ))
+        .unwrap_or_else(|_| unreachable!());
         std::fs::create_dir_all(server.directory.join("not-a-job")).unwrap();
 
         assert_eq!(waiting.recv().unwrap(), done);
@@ -1706,18 +1820,46 @@ mod tests {
         // after this one stopped half way through would.
         let mut during = None;
         assert_eq!(waiting.recv().unwrap(), interrupted);
-        generate(&server, &interrupted, |_, _, _| {
+        generate(&server, &interrupted, |_, _, watch| {
+            watch(&crate::image::Report {
+                timings: crate::image::Timings {
+                    steps: vec![3.0],
+                    ..Default::default()
+                },
+                preview_step: Some(1),
+                ..Default::default()
+            });
             during = Some(restore_all(&server.directory));
             Ok(())
         });
         let during = during.unwrap();
-        assert_eq!(during[&interrupted].state.name(), "failed");
-        assert_eq!(during[&interrupted].failure.as_deref(), Some(INTERRUPTED));
+        // It keeps what it had reported, and ended when that was written.
+        let stopped = &during[&interrupted];
+        assert_eq!(stopped.state.name(), "failed");
+        assert_eq!(stopped.failure.as_deref(), Some(INTERRUPTED));
+        assert_eq!(stopped.preview_step, Some(1));
+        assert_eq!(stopped.timings["steps"], json!([3.0]));
+        assert!(stopped.finished_at.is_some());
+        assert!(stopped.provenance["machine"].is_object());
 
         let restored = restore_all(&server.directory);
-        let mut ids: Vec<&String> = restored.keys().collect();
-        ids.sort();
-        assert_eq!(ids, [&done, &cancelled, &interrupted]);
+        let mut ids: Vec<&str> = restored.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        let mut expected = [
+            done.as_str(),
+            cancelled.as_str(),
+            interrupted.as_str(),
+            waiting_still.as_str(),
+            cancelled_waiting.as_str(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+        assert_eq!(restored[&waiting_still].state.name(), "failed");
+        assert_eq!(
+            restored[&waiting_still].failure.as_deref(),
+            Some(INTERRUPTED)
+        );
+        assert_eq!(restored[&cancelled_waiting].state.name(), "cancelled");
         let jobs = server.jobs.lock().unwrap();
         for id in [&done, &cancelled, &interrupted] {
             let (mut live, mut again) = (jobs[id].describe(id), restored[id].describe(id));
@@ -1756,6 +1898,7 @@ mod tests {
             .unwrap()
             .iter()
             .map(|generation| generation["id"].as_str().unwrap())
+            .filter(|id| [&done, &cancelled, &interrupted].contains(&&id.to_string()))
             .collect();
         assert_eq!(listed, [&interrupted, &cancelled, &done]);
         std::fs::remove_dir_all(&server.directory).unwrap();
@@ -1763,63 +1906,95 @@ mod tests {
     }
 
     #[test]
-    fn one_stream_says_what_changes_of_every_generation() {
-        let (server, _waiting) = test_server("events");
-        let mut said = HashMap::new();
-        assert!(changes(&server, &mut said).is_empty());
-        let id = queue_picture(&server);
-        let announced = changes(&server, &mut said);
-        assert_eq!(announced.len(), 1);
-        assert_eq!(announced[0].0, "generation");
-        assert_eq!(announced[0].1["id"], id.as_str());
-        assert_eq!(announced[0].1["state"], "queued");
-        assert!(changes(&server, &mut said).is_empty());
-
-        let report = crate::image::Report {
-            preview_step: Some(2),
-            ..Default::default()
-        };
-        server
-            .jobs
+    fn one_stream_says_each_change_of_every_generation_as_it_is_made() {
+        let _runs = RUNS
             .lock()
-            .unwrap()
-            .get_mut(&id)
-            .unwrap()
-            .take_report(&report);
-        let announced = changes(&server, &mut said);
-        let names: Vec<&str> = announced.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["generation", "preview"]);
-        assert_eq!(announced[1].1["id"], id.as_str());
-        assert_eq!(announced[1].1["step"], 2);
-        assert_eq!(
-            announced[1].1["url"],
-            format!("/v1/generations/{id}/preview/2")
-        );
-        // A change that brings no new preview says only the generation.
-        server.jobs.lock().unwrap().get_mut(&id).unwrap().state = Stage::Cancelled;
-        let names: Vec<&str> = changes(&server, &mut said)
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        assert_eq!(names, ["generation"]);
-        server.jobs.lock().unwrap().remove(&id);
-        assert!(changes(&server, &mut said).is_empty());
-        assert!(said.is_empty());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (server, _waiting) = test_server("events");
+        let mut listening = server.announcements.subscribe();
+        let mut heard = || {
+            let mut heard = Vec::new();
+            while let Ok(announcement) = listening.try_recv() {
+                heard.push(announcement);
+            }
+            heard
+        };
 
-        // The stream starts with a snapshot and goes on with what is announced.
+        // Each change is told as it is made, even ones that follow at once, so none merge.
+        let id = queue_picture(&server);
+        generate(&server, &id, |_, _, watch| {
+            crate::generation::reached(crate::generation::Progress {
+                step: 1,
+                steps: 2,
+                seconds: 1.0,
+            });
+            watch(&crate::image::Report {
+                preview_step: Some(1),
+                ..Default::default()
+            });
+            Ok(())
+        });
+        let heard_of = heard();
+        let told: Vec<(&str, &str)> = heard_of
+            .iter()
+            .map(|(name, data)| (*name, data["state"].as_str().unwrap_or("")))
+            .collect();
+        assert_eq!(
+            told,
+            [
+                ("generation", "queued"),
+                ("generation", "running"),
+                ("generation", "running"),
+                ("preview", ""),
+                ("generation", "done"),
+            ]
+        );
+        let preview = &heard_of[3].1;
+        assert_eq!(preview["id"], id.as_str());
+        assert_eq!(preview["step"], 1);
+        assert_eq!(preview["steps"], 2);
+        assert_eq!(preview["url"], format!("/v1/generations/{id}/preview/1"));
+        // Nothing has changed since, so looking for steps says nothing.
+        server.announce(&server.jobs.lock().unwrap());
+        assert!(heard().is_empty());
+
+        // One taken away is told of too.
+        let (status, _) = answer(block(forget(State(Arc::clone(&server)), Path(id.clone()))));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let heard_of = heard();
+        assert_eq!(heard_of.len(), 1);
+        assert_eq!(heard_of[0].0, "removed");
+        assert_eq!(heard_of[0].1, json!({ "id": id }));
+
+        // The stream starts with a snapshot and goes on with what is announced. One that falls
+        // behind is sent a snapshot in place of what it missed, and nothing from before it.
         let again = queue_picture(&server);
         let body = block(async {
             use futures_util::StreamExt;
 
             let response = all_events(State(Arc::clone(&server))).await.into_response();
             let mut frames = response.into_body().into_data_stream();
-            let first = frames.next().await.unwrap().unwrap();
+            let mut next =
+                async || String::from_utf8(frames.next().await.unwrap().unwrap().to_vec()).unwrap();
+            let first = next().await;
             server
                 .announcements
                 .send(("generation", json!({ "id": again })))
                 .unwrap();
-            let second = frames.next().await.unwrap().unwrap();
-            [first, second].map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+            let second = next().await;
+            for stale in 0..=ANNOUNCEMENTS {
+                server
+                    .announcements
+                    .send(("generation", json!({ "stale": stale })))
+                    .unwrap();
+            }
+            let third = next().await;
+            server
+                .announcements
+                .send(("generation", json!({ "fresh": true })))
+                .unwrap();
+            let fourth = next().await;
+            [first, second, third, fourth]
         });
         assert!(
             body[0].starts_with("event: snapshot\ndata: {\"generations\":[{"),
@@ -1831,6 +2006,8 @@ mod tests {
             body[1],
             format!("event: generation\ndata: {{\"id\":\"{again}\"}}\n\n")
         );
+        assert!(body[2].starts_with("event: snapshot\n"), "{}", body[2]);
+        assert_eq!(body[3], "event: generation\ndata: {\"fresh\":true}\n\n");
         std::fs::remove_dir_all(&server.directory).unwrap();
     }
 
