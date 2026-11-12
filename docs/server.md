@@ -67,6 +67,13 @@ curl -X POST http://localhost:8833/v1/generations \
     "sparse_start": null,
     "draft_steps": null,
     "latent_upscaler": null,
+    "renoise_sigma": null,
+    "steps": null,
+    "shift": null,
+    "patch": null,
+    "lora": null,
+    "lora_strength": null,
+    "lora_mode": null,
     "references": []
   },
   "created_at": 1790037819.52,
@@ -80,8 +87,10 @@ curl -X POST http://localhost:8833/v1/generations \
 `state` is `queued`, `running`, `done`, `failed` or `cancelled`, `seconds` is how long it took once
 it has ended, and `error` says why it is `failed`. `kind` is `video` or `image`. `request` is what
 the request asked for: the prompt, from `prompt-file` when it came as a file, the names of its
-references and of its latent upscaler, and the attention, its precision, the draft steps and
-Sol-Attn's `sparse_tau` and `sparse_start` it asked for, with a picture's defaults where the request
+references, of its latent upscaler and of its `patch` and `lora`, and the attention, its precision,
+the draft steps, `renoise_sigma`, the uniform `steps` and their `shift`, the LoRA's `lora_strength`
+and `lora_mode`, and Sol-Attn's `sparse_tau` and `sparse_start` it asked for, with a picture's
+defaults where the request
 left an option out and `null` where a video's are its own or a setting has the backend's default. `created_at`, `started_at` and `finished_at` are Unix times in seconds.
 `timings` and `preview_step` are a picture's, see [Asking for a picture](#asking-for-a-picture).
 
