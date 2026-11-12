@@ -257,7 +257,8 @@ step it reports, and reads every one under the jobs directory back when it start
 generations of the server before it are listed again, the most recent first, and their pictures
 and previews are there to be taken. One that was waiting or running when that server stopped is
 `failed`, since it never ended, with the steps and the previews it had and the time its metadata
-was last written as its `finished_at`.
+was last written as its `finished_at`. A directory whose `metadata.json` cannot be read but which
+holds what a generation writes is listed as `failed` too, so that it can be taken away.
 
 ## What a server holds
 

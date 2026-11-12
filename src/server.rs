@@ -371,6 +371,47 @@ fn restore(directory: &std::path::Path) -> Result<(Job, bool), String> {
     Ok((job, interrupted))
 }
 
+/// A job whose metadata is lost, from what its directory still holds, so that it is listed and
+/// can be taken away with what it holds; or None for a directory that holds nothing a job writes.
+fn salvage(directory: &std::path::Path, why: &str) -> Option<Job> {
+    let names: Vec<std::ffi::OsString> = std::fs::read_dir(directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    let video = names
+        .iter()
+        .any(|name| std::path::Path::new(name).file_stem() == Some("video".as_ref()));
+    let partial = format!(".{METADATA}");
+    let a_job_wrote = |name: &std::ffi::OsString| {
+        [METADATA, &partial, REFERENCES, PREVIEWS, "image.png"]
+            .iter()
+            .any(|written| name == written)
+    };
+    if !video && !names.iter().any(a_job_wrote) {
+        return None;
+    }
+    let output = if video {
+        Output::Video
+    } else {
+        Output::Picture
+    };
+    let mut job = Job::new(
+        output,
+        Vec::new(),
+        directory.to_owned(),
+        written_in(directory, output),
+    );
+    job.state = Stage::Failed;
+    job.failure = Some(format!("{LOST}: {why}"));
+    job.request = serde_json::Value::Null;
+    job.queued = std::fs::metadata(directory)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(UNIX_EPOCH);
+    job.finished_at = Some(job.queued);
+    Some(job)
+}
+
 /// Every job under the jobs directory `directory` that a server before this one left, by id.
 fn restore_all(directory: &std::path::Path) -> HashMap<String, Job> {
     let Ok(entries) = std::fs::read_dir(directory) else {
@@ -382,8 +423,25 @@ fn restore_all(directory: &std::path::Path) -> HashMap<String, Job> {
         let Ok(id) = entry.file_name().into_string() else {
             continue;
         };
-        let Ok((job, put_right)) = restore(&path) else {
+        // What the system leaves in a directory, such as Finder's .DS_Store, is not a job.
+        if id.starts_with('.') || !path.is_dir() {
             continue;
+        }
+        let (job, put_right) = match restore(&path) {
+            Ok(restored) => restored,
+            Err(why) => match salvage(&path, &why) {
+                Some(job) => {
+                    eprintln!("warning: listing the generation {id} as failed, since {why}");
+                    (job, true)
+                }
+                None => {
+                    eprintln!(
+                        "warning: skipping {}, which holds no generation: {why}",
+                        path.display()
+                    );
+                    continue;
+                }
+            },
         };
         // What the metadata said of a job is put right, so that it says so the next time too.
         if put_right {
@@ -396,6 +454,8 @@ fn restore_all(directory: &std::path::Path) -> HashMap<String, Job> {
 
 /// Why a job restored waiting or running failed.
 const INTERRUPTED: &str = "the server stopped before this generation ended";
+/// Why a job restored without its metadata failed.
+const LOST: &str = "what this generation was asked is lost";
 
 /// Writes a job's `metadata.json` beside what it wrote. A job that cannot have its metadata written
 /// still runs, and says so.
@@ -409,7 +469,8 @@ fn persist(job: &Job, id: &str) {
 }
 
 /// Writes `metadata` as the `metadata.json` of `directory`. It is written beside and renamed, so
-/// that a server starting never reads half of one.
+/// that a server starting never reads half of one, and synced before and after the rename, so that
+/// a machine that loses power keeps the old one or the new one rather than an empty one.
 fn write_metadata(
     directory: &std::path::Path,
     metadata: &serde_json::Value,
@@ -418,8 +479,11 @@ fn write_metadata(
 
     let partial = directory.join(format!(".{METADATA}"));
     let bytes = serde_json::to_vec_pretty(metadata).map_err(std::io::Error::other)?;
-    std::fs::File::create(&partial)?.write_all(&bytes)?;
-    std::fs::rename(&partial, directory.join(METADATA))
+    let mut file = std::fs::File::create(&partial)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&partial, directory.join(METADATA))?;
+    std::fs::File::open(directory)?.sync_all()
 }
 
 fn unix_seconds(time: SystemTime) -> f64 {
@@ -1799,6 +1863,12 @@ mod tests {
         ))
         .unwrap_or_else(|_| unreachable!());
         std::fs::create_dir_all(server.directory.join("not-a-job")).unwrap();
+        std::fs::write(server.directory.join(".DS_Store"), b"").unwrap();
+        // One whose metadata a lost write left empty, beside the picture it made.
+        let lost = server.directory.join("lost");
+        std::fs::create_dir_all(&lost).unwrap();
+        std::fs::write(lost.join(METADATA), b"").unwrap();
+        std::fs::write(lost.join("image.png"), b"png").unwrap();
 
         assert_eq!(waiting.recv().unwrap(), done);
         generate(&server, &done, |_, _, watch| {
@@ -1851,6 +1921,7 @@ mod tests {
             interrupted.as_str(),
             waiting_still.as_str(),
             cancelled_waiting.as_str(),
+            "lost",
         ];
         expected.sort_unstable();
         assert_eq!(ids, expected);
@@ -1860,6 +1931,16 @@ mod tests {
             Some(INTERRUPTED)
         );
         assert_eq!(restored[&cancelled_waiting].state.name(), "cancelled");
+        assert_eq!(restored["lost"].state.name(), "failed");
+        assert!(
+            restored["lost"]
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.starts_with(LOST))
+        );
+        // What was put right is written, so the next server reads it as it is.
+        let again = restore_all(&server.directory);
+        assert_eq!(again["lost"].failure, restored["lost"].failure);
         let jobs = server.jobs.lock().unwrap();
         for id in [&done, &cancelled, &interrupted] {
             let (mut live, mut again) = (jobs[id].describe(id), restored[id].describe(id));
