@@ -226,8 +226,10 @@ curl -X POST http://localhost:8833/v1/generations/6ab1cf3b0000/cancel
 
 This answers 202 and the generation. One waiting its turn is `cancelled` at once and never runs.
 One running stops at the boundary of its next step, or before the model it is reading next, and is
-`cancelled` once it has, which for a picture is within one step. A generation that has ended
-answers 409. A cancelled picture keeps the previews of the steps it took.
+`cancelled` once it has, which for a picture is within one step. One that has taken its last step
+and is decoding or writing what it made can no longer stop, and answers 409, as does a generation
+that has ended, cancelled ones included. A cancelled picture keeps the previews of the steps it
+took.
 
 ## Taking the video
 

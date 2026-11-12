@@ -179,9 +179,19 @@ pub fn starting() {
     CANCELLED.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Asks the run here to stop at its next step boundary.
-pub fn cancel() {
+/// Asks the run here to stop at its next step boundary, or says false for a run past its last step,
+/// which has no boundary left to stop at and goes on to write what it made.
+pub fn cancel() -> bool {
+    // Under the lock `reached` takes, so that a run either reaches its last step after the flag
+    // is up, and stops at the boundary after it, or is seen to have reached it.
+    let progress = PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if progress.is_some_and(|progress| progress.step >= progress.steps) {
+        return false;
+    }
     CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// Fails with [`Cancelled`] when the run here was asked to stop, for a run to call where it can
@@ -1113,6 +1123,8 @@ pub fn sample(
             workers = target.workers;
         }
     }
+    // The boundary after the last step, which a run asked to stop during that step stops at.
+    check_cancelled()?;
     #[cfg(feature = "cuda")]
     save_algorithm_cache();
     Ok((video, audio))

@@ -1051,6 +1051,7 @@ async fn forget(
 
 /// Stops a generation: one waiting its turn is dropped from the queue, and one running stops at the
 /// boundary of its next step. Either keeps what it wrote, and is `cancelled` once it has stopped.
+/// One past its last step, which is writing what it made, has no boundary left to stop at.
 async fn cancel(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
@@ -1063,9 +1064,16 @@ async fn cancel(
             job.finished_at = Some(SystemTime::now());
             server.changed(&jobs, &id);
         }
-        Stage::Running => crate::generation::cancel(),
-        Stage::Cancelled => {}
-        Stage::Done | Stage::Failed => return Err(Failure::gone("that generation has ended")),
+        Stage::Running => {
+            if !crate::generation::cancel() {
+                return Err(Failure::gone(
+                    "that generation has taken its last step and is writing what it made",
+                ));
+            }
+        }
+        Stage::Done | Stage::Failed | Stage::Cancelled => {
+            return Err(Failure::gone("that generation has ended"));
+        }
     }
     Ok((StatusCode::ACCEPTED, Json(jobs[&id].describe(&id))).into_response())
 }
@@ -1660,6 +1668,12 @@ mod tests {
         )));
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(body["state"], "cancelled");
+        // It has ended, so cancelling it again is refused like any other that has.
+        let (status, _) = answer(block(cancel(
+            State(Arc::clone(&server)),
+            Path(queued.clone()),
+        )));
+        assert_eq!(status, StatusCode::CONFLICT);
 
         // One running stops at the next step boundary it reaches.
         assert_eq!(waiting.recv().unwrap(), running);
@@ -1696,6 +1710,23 @@ mod tests {
         )));
         assert_eq!(status, StatusCode::CONFLICT);
 
+        // One past its last step is writing what it made, and cannot stop any more.
+        let writing = queue_picture(&server);
+        generate(&server, &writing, |_, _, _| {
+            crate::generation::reached(crate::generation::Progress {
+                step: 2,
+                steps: 2,
+                seconds: 1.0,
+            });
+            let (status, _) = answer(block(cancel(
+                State(Arc::clone(&server)),
+                Path(writing.clone()),
+            )));
+            assert_eq!(status, StatusCode::CONFLICT);
+            crate::generation::check_cancelled()?;
+            Ok(())
+        });
+        assert_eq!(state(&server, &writing), "done");
         let (status, _) = answer(block(cancel(
             State(Arc::clone(&server)),
             Path("nothing".to_owned()),
